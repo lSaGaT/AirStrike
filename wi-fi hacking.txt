@@ -1,0 +1,119 @@
+Fala, pessoal! Quem curtiu a aula sobre Wi-Fi hacking usando o Wifite? 😂
+
+Fiz alguns testes por aqui e consegui resultados em algumas redes. Mas percebi que o Wifite às vezes falha bastante. Preguiça dele, só pode kkkkkk.
+
+Por isso, comecei a fazer algumas etapas manualmente usando as ferramentas do Kali Linux. Estou achando mais interessante porque consigo entender melhor o que acontece em cada fase.
+
+Vou compartilhar com vocês como funciona.
+
+**1. Primeiro, vamos encontrar as redes Wi-Fi**
+
+Execute o comando abaixo para listar as redes que estão ao alcance da sua antena:
+
+```bash
+sudo airodump-ng wlan0mon
+```
+
+Uma lista de redes vai aparecer na tela em tempo real.
+
+Observe duas informações importantes.
+
+**BSSID:** é o endereço que identifica o roteador.
+
+**CH:** é o canal utilizado pela rede.
+
+Quando localizar a rede do seu laboratório, anote essas informações e pressione `Ctrl + C` para interromper a busca.
+
+**2. Agora vamos acompanhar uma rede específica**
+
+Com o canal e o endereço do roteador anotados, podemos selecionar uma rede para acompanhar os pacotes capturados.
+
+Substitua `CANAL_DA_REDE` pelo canal encontrado e `MAC_DO_ROTEADOR` pelo BSSID correspondente.
+
+```bash
+sudo airodump-ng -c CANAL_DA_REDE --bssid MAC_DO_ROTEADOR -w /home/kali/Desktop/captura_aula wlan0mon
+```
+
+Esse comando acompanha a rede escolhida e salva os dados capturados em um arquivo na Área de Trabalho.
+
+O arquivo será utilizado nas próximas etapas do teste.
+
+**3. Testando a desconexão dos dispositivos**
+
+Agora vamos conhecer o Aireplay-ng, outra ferramenta do Kali Linux.
+
+Em testes autorizados, ela pode ser utilizada para avaliar como uma rede reage a solicitações de desconexão.
+
+O comando utilizado nessa técnica é:
+
+```bash
+sudo aireplay-ng -0 10 -a MAC_DO_ROTEADOR wlan0mon
+```
+
+Entendendo o comando:
+
+`sudo` executa a ferramenta com permissões administrativas.
+
+`aireplay-ng` é o nome da ferramenta.
+
+`-0 10` seleciona o modo de desautenticação e define a quantidade de solicitações.
+
+`-a MAC_DO_ROTEADOR` indica o endereço do roteador utilizado no teste.
+
+`wlan0mon` é a interface de rede configurada para monitoramento.
+
+Atenção: esse procedimento pode interromper a conexão de dispositivos. Faça o teste somente em redes próprias ou com autorização explícita.
+
+**4. Preparando a lista de senhas**
+
+Uma das listas conhecidas para testes de segurança é a RockYou. Ela contém milhões de senhas que podem ser utilizadas em laboratórios para avaliar a resistência de uma senha.
+
+Primeiro, vamos verificar se o arquivo existe no Kali Linux:
+
+```bash
+ls -lh /usr/share/wordlists/rockyou.txt*
+```
+
+Se aparecer o arquivo `rockyou.txt.gz`, significa que a lista está compactada.
+
+Para descompactá-la sem apagar o arquivo original, execute:
+
+```bash
+sudo gzip -dk /usr/share/wordlists/rockyou.txt.gz
+```
+
+Agora confira se o arquivo está disponível:
+
+```bash
+ls -lh /usr/share/wordlists/rockyou.txt
+```
+
+Pronto! A lista está preparada para ser utilizada nos testes.
+
+**5. Entendendo a tentativa de descobrir a senha**
+
+Depois da captura, podemos utilizar o Aircrack-ng para testar senhas de uma lista contra os dados de autenticação capturados.
+
+Para consultar as opções da ferramenta, execute:
+
+```bash
+man aircrack-ng
+```
+
+O resultado depende da qualidade da captura e das senhas presentes na lista.
+
+Se uma senha compatível for encontrada, o programa indicará que a chave foi localizada.
+
+Se nenhuma senha for encontrada, isso não significa necessariamente que a rede seja invulnerável. Pode ser que a senha não esteja na lista ou que a captura não tenha os dados necessários.
+
+**6. O que podemos aprender com isso?**
+
+O mais interessante de executar as etapas manualmente é entender o papel de cada ferramenta, em vez de depender apenas de uma automação.
+
+O Wifite facilita algumas tarefas, enquanto ferramentas como Airodump-ng, Aireplay-ng e Aircrack-ng permitem estudar diferentes partes do processo separadamente.
+
+E aí, pessoal? Vocês preferem usar o Wifite para automatizar o processo ou gostam de executar os comandos manualmente para entender melhor o que acontece em cada etapa?
+
+Compartilhem suas experiências nos laboratórios!
+
+Lembrando que os testes devem ser realizados apenas em redes próprias ou com autorização do responsável.

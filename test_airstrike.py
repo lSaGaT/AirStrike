@@ -1,0 +1,121 @@
+"""Teste rápido do parser do AirStrike (não faz parte da ferramenta)."""
+import os
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import airstrike as m
+
+SAMPLE = """\
+Airodump-ng 1.7
+
+BSSID, First time seen, Last time seen, channel, Speed, Privacy, Cipher, Authentication, Power, # beacons, # IV, LAN IP, ID-length, ESSID, Key
+AA:BB:CC:DD:EE:FF, 2026-10-13 10:00:00, 2026-10-13 10:01:00,  6,  54, WPA2, CCMP, PSK, -45, 120, 3456,   0.  0.  0.  0,  9, MinhaCasa,
+11:22:33:44:55:66, 2026-10-13 10:00:00, 2026-10-13 10:01:00, 11,  54, WPA2 WPA3, CCMP, SAE, -70,  80, 12,   0.  0.  0.  0, 12, Rede, Com, Virgula,
+FF:EE:DD:CC:BB:AA, 2026-10-13 10:00:00, 2026-10-13 10:01:00,  1,  54, WEP, WEP, OPN, -80,  10, 0,   0.  0.  0.  0,  0, ,
+0A:1B:2C:3D:4E:5F, 2026-10-13 10:00:00, 2026-10-13 10:01:00,  3,  54, WPA2, CCMP, MGT, -60, 200, 100,   0.  0.  0.  0, 10, CorpWiFi,
+
+Station MAC, First time seen, Last time seen, Power, # packets, BSSID, Probed ESSIDs
+DE:AD:BE:EF:00:01, 2026-10-13 10:00:10, 2026-10-13 10:01:00, -50, 30, AA:BB:CC:DD:EE:FF,
+DE:AD:BE:EF:00:02, 2026-10-13 10:00:10, 2026-10-13 10:01:00, -55, 12, AA:BB:CC:DD:EE:FF,
+DE:AD:BE:EF:00:03, 2026-10-13 10:00:10, 2026-10-13 10:01:00, -60,  4, (not associated),
+"""
+
+HASH22000 = """\
+WPA*01*1be0533e31276056369c8e9a5e0c30be*d46d6dd8d100*4aada961cf14*686173686361742d6573736964*0103005f00100100005003750020*
+WPA*02*0103005f0010010000500375*d46d6dd8d100*4aada961cf14*686173686361742d6573736964*0103005f0010010000500375*
+WPA*02*999999999999999999999999*aabbccddeeff*4aada961cf14*686173686361742d6573736964*0103005f0010010000500375*
+"""
+
+fails = []
+
+
+def check(name, cond):
+    print(("OK  " if cond else "FAIL") + " " + name)
+    if not cond:
+        fails.append(name)
+
+
+tmp = tempfile.mkdtemp()
+path = os.path.join(tmp, "scan-01.csv")
+with open(path, "w", encoding="utf-8") as fh:
+    fh.write(SAMPLE)
+
+redes, clientes = m.parse_airodump_csv(path)
+
+check("4 redes lidas", len(redes) == 4)
+check("3 clientes lidos", len(clientes) == 3)
+check("BSSID maiusculo", redes[0]["bssid"] == "AA:BB:CC:DD:EE:FF")
+check("ESSID simples", redes[0]["essid"] == "MinhaCasa")
+check("IVs inteiros", redes[0]["ivs"] == 3456)
+check("canal", redes[0]["channel"] == "6")
+check("ESSID com virgula", redes[1]["essid"] == "Rede, Com, Virgula")
+check("ESSID oculto vazio", redes[2]["essid"] == "")
+check("enc WEP", "WEP" in redes[2]["privacy"])
+check("2 clientes no alvo", redes[0]["clients"] == 2)
+check("sem clientes na rede oculta", redes[2]["clients"] == 0)
+check("auth MGT detectada", "MGT" in redes[3]["auth"])
+
+# ordenacao por sinal (mais forte primeiro)
+redes_sorted = sorted(redes, key=lambda r: m._power_int(r["power"]), reverse=True)
+check("ordem por potencia", redes_sorted[0]["power"] == "-45")
+
+# tabela (apenas garantir que nao lanca excecao)
+m.print_networks(redes)
+m.print_networks([])
+
+# regex de KEY FOUND
+check("KEY FOUND simples", m.KEY_FOUND_RE.search("KEY FOUND! [ hunter2 ]").group(1) == "hunter2")
+check("KEY FOUND com espacos", m.KEY_FOUND_RE.search("  KEY FOUND! [ minha senha ]  ").group(1) == "minha senha")
+
+# ---------------------------------------------------------------------------
+# PMKID / formato 22000
+# ---------------------------------------------------------------------------
+h22k = os.path.join(tmp, "hash.22000")
+with open(h22k, "w", encoding="utf-8") as fh:
+    fh.write(HASH22000)
+
+check("22000: 1 PMKID + 2 EAPOL sem filtro", m.count_hashes_in_22000(h22k) == (1, 2))
+check("22000: filtro por BSSID", m.count_hashes_in_22000(h22k, "D4:6D:6D:D8:D1:00") == (1, 1))
+check("22000: BSSID sem correspondencia", m.count_hashes_in_22000(h22k, "00:11:22:33:44:55") == (0, 0))
+check("22000: arquivo inexistente", m.count_hashes_in_22000(os.path.join(tmp, "nao.existe")) == (0, 0))
+
+# extract_22000 devolve None quando nao ha hcxpcapngtool, ou tupla
+r = m.extract_22000(os.path.join(tmp, "x.cap"), os.path.join(tmp, "x.22000"), "AA:BB:CC:DD:EE:FF")
+check("extract_22000 devolve None ou tupla", r is None or isinstance(r, tuple))
+
+# ---------------------------------------------------------------------------
+# Banner
+# ---------------------------------------------------------------------------
+linhas = m.render_banner("AirStrike")
+check("banner tem 6 linhas", linhas is not None and len(linhas) == 6)
+check("banner largura igual", len(set(len(l) for l in linhas)) == 1)
+check("banner largura 53", len(linhas[0]) == 53)
+check("banner render sem excecao", m.print_banner() is None)
+check("nome do app AirStrike", m.__appname__ == "AirStrike")
+
+# ---------------------------------------------------------------------------
+# argparse
+# ---------------------------------------------------------------------------
+p = m.build_parser()
+a = p.parse_args(["--bssid", "AA:BB:CC:DD:EE:FF", "--deauth", "0", "--yes"])
+check("argparse bssid", a.bssid == "AA:BB:CC:DD:EE:FF")
+check("argparse deauth 0", a.deauth == 0)
+check("argparse yes", a.yes is True)
+check("argparse padrao wordlist", a.wordlist == "/usr/share/wordlists/rockyou.txt")
+check("argparse cracker padrao auto", a.cracker == "auto")
+
+a2 = p.parse_args(["--cracker", "hashcat", "--hashcat-args", "--force -D 1"])
+check("argparse cracker hashcat", a2.cracker == "hashcat")
+check("argparse hashcat-args", a2.hashcat_args == "--force -D 1")
+check("shlex de hashcat-args", m.shlex.split(a2.hashcat_args) == ["--force", "-D", "1"])
+
+try:
+    p.parse_args(["--cracker", "wpaif"])
+    check("argparse cracker invalido rejeitado", False)
+except SystemExit:
+    check("argparse cracker invalido rejeitado", True)
+
+print()
+print("FALHAS: %d" % len(fails))
+sys.exit(1 if fails else 0)
