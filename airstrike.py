@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-AirStrike — auditoria automatizada de redes Wi-Fi (estilo Wifite), baseada nos
-passos do "wi-fi hacking.txt".
+AirStrike: auditoria automatizada de redes Wi-Fi para Kali Linux.
 
-Fluxo automatizado (mesmas ferramentas do arquivo de notas):
+Fluxo completo (aircrack-ng suite + hcxtools + hashcat):
   1) airmon-ng  -> coloca a interface em modo monitor
   2) airodump-ng -> varre as redes ao alcance e mostra uma tabela
   3) airodump-ng -> captura pacotes da rede alvo (canal + BSSID)
@@ -820,7 +819,7 @@ def confirm_authorization(args):
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="AirStrike: automatiza os passos do wi-fi hacking.txt "
+        description="AirStrike: auditoria automatizada de redes Wi-Fi "
                     "(airmon/airodump/aireplay/aircrack + PMKID via hcxtools/hashcat). "
                     "Use somente com autorizacao.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
@@ -851,7 +850,7 @@ def main(argv=None):
     args = build_parser().parse_args(argv)
 
     if os.geteuid() != 0:
-        err("execute com sudo: sudo python3 airstrike.py")
+        err("execute com sudo: sudo airstrike")
         sys.exit(1)
 
     print_banner()
