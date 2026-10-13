@@ -166,6 +166,11 @@ sudo airstrike --bssid AA:BB:CC:DD:EE:FF --no-crack
 | `--iv-target` | 20000 | quantidade minima de IVs no ataque WEP |
 | `--cracker` | auto | quebrador WPA: auto, aircrack ou hashcat |
 | `--hashcat-args` | nada | argumentos extras do hashcat entre aspas |
+| `--masks` | numeric8 | frentes de mascara (presets ou mascaras crus, com virgula) |
+| `--increment` | nada | adiciona a frente de incremento numerico 1 ate 8 |
+| `--rules` | nada | regras do hashcat para a wordlist, ex: best64.rule |
+| `--hspeed` | 150000 | hashes/s usados na estimativa de tempo |
+| `--bench` | nada | mede a velocidade real do hashcat antes de estimar |
 | `--out` | captures | pasta das capturas e resultados |
 | `--no-crack` | nada | para apos a captura, sem testar senhas |
 | `--keep` | nada | nao restaura a placa ao final |
@@ -174,6 +179,60 @@ sudo airstrike --bssid AA:BB:CC:DD:EE:FF --no-crack
 Com `--cracker auto`, se o hcxpcapngtool extrair algum hash PMKID ou
 EAPOL e o hashcat estiver instalado, a quebra e feita pelo hashcat no
 formato 22000. Se nao, usa o aircrack-ng direto no arquivo .cap.
+
+## Pipeline de quebra e modo mascara
+
+Apos capturar o handshake ou o PMKID, o AirStrike abre as frentes de
+quebra em fila, da mais barata a mais cara. Ctrl+C durante uma frente
+pula para a proxima:
+
+1. **Wordlist**: testa o rockyou.txt (e regras do hashcat com `--rules`)
+2. **Mascaras**: varre combinacoes com `hashcat -a 3`, sem depender de lista
+3. **Incremento**: com `--increment`, testa de 1 ate 8 digitos
+
+Presets de mascara prontos:
+
+| Preset | Mascaras | Espaco de busca |
+|--------|----------|-----------------|
+| `numeric6` a `numeric10` | so digitos | 1 milhao ate 10 bilhoes |
+| `factory` | 4d+4l, 4l+4d, 6d+2l | ~460 milhoes no total |
+| `alnum8` | 8 posicoes letra+digito | 218 bilhoes |
+
+Voce tambem pode escrever mascaras crus separadas por virgula. Tokens:
+`?d` digito, `?l` minuscula, `?u` maiuscula, `?a` todos imprimiveis.
+
+Antes de comecar, o AirStrike mostra a estimativa de tempo de cada frente:
+
+```
+  Frente                         Espaco      Tempo estimado
+  ------------------------------------------------------------------
+  wordlist rockyou.txt             14.344.392            1.6min
+  mascara numeric8                100.000.000           11.1min
+  ------------------------------------------------------------------
+  TOTAL                           114.344.392           12.7min
+```
+
+Exemplos:
+
+```bash
+# Senha so de digitos (padrao de fabricante): wordlist + 8 digitos + incremento
+sudo airstrike --bssid AA:BB:CC:DD:EE:FF --masks numeric8 --increment
+
+# Varios presets e mascaras crus de uma vez
+sudo airstrike --masks "numeric8,numeric10,factory,?l?l?l?l?d?d?d?d"
+
+# Regras do hashcat na wordlist (multiplica os candidatos gerados)
+sudo airstrike --rules /usr/share/hashcat/rules/best64.rule
+
+# Medir a GPU real antes de estimar os tempos
+sudo airstrike --bench
+```
+
+A conta e simples: 8 digitos = 100 milhoes de combinacoes. Uma GPU
+intermedia testa ~150 mil senhas por segundo, ou seja, cai em ~11
+minutos. Ja 8 posicoes com letras e digitos (62^8) sao 218 bilhoes,
+que e assunto para dias de GPU. Por isso a fila sempre comeca pelo
+conjunto menor.
 
 ## Arquivos gerados
 

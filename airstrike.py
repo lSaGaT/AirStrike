@@ -41,6 +41,24 @@ DEFAULT_WORDLIST = "/usr/share/wordlists/rockyou.txt"
 BSSID_RE = re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
 KEY_FOUND_RE = re.compile(r"KEY FOUND!\s*\[\s*(.+?)\s*\]")
 
+# Frentes de quebra (modo mascara hashcat -a 3).
+# Cada frente: (nome, mascara, charsets custom (-1..-4) ou None, increment?)
+# Tokens: ?d digitos, ?l minusculas, ?s especiais, ?a todos imprimiveis
+MASK_PRESETS = {
+    "numeric6": [("numeric6", "?d" * 6, None, False)],
+    "numeric7": [("numeric7", "?d" * 7, None, False)],
+    "numeric8": [("numeric8", "?d" * 8, None, False)],
+    "numeric9": [("numeric9", "?d" * 9, None, False)],
+    "numeric10": [("numeric10", "?d" * 10, None, False)],
+    "factory": [("factory 4d+4l", "?d?d?d?d?l?l?l?l", None, False),
+                ("factory 4l+4d", "?l?l?l?l?d?d?d?d", None, False),
+                ("factory 6d+2l", "?d?d?d?d?d?d?l?l", None, False)],
+    "alnum8": [("alnum8", "?1" * 8, {"-1": "?l?u?d"}, False)],
+}
+
+# Tamanho do charset de cada token do hashcat (para calcular o espaco de busca)
+CHARSET_SIZES = {"?d": 10, "?l": 26, "?u": 26, "?s": 33, "?a": 95, "?b": 256}
+
 # Cores (desativadas automaticamente se a saída não for um terminal)
 USE_COLOR = sys.stdout.isatty()
 
@@ -677,8 +695,13 @@ def extract_22000(cap_file, out_file, bssid=None):
     return count_hashes_in_22000(out_file, bssid)
 
 
-def crack_hashcat(hash_file, wordlist, extra_args=None):
-    """Quebra um .22000 com o hashcat (-m 22000). Devolve a chave ou None."""
+def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
+                  mask=None, custom=None, increment=False):
+    """Quebra um .22000 com o hashcat (-m 22000). Devolve a chave ou None.
+
+    Com mask faz ataque de mascara (-a 3); sem mask usa a wordlist (-a 0),
+    opcionalmente com regras do hashcat (-r arquivo).
+    """
     if not os.path.exists(hash_file):
         err(f"arquivo de hashes nao encontrado: {hash_file}")
         return None
@@ -690,11 +713,21 @@ def crack_hashcat(hash_file, wordlist, extra_args=None):
     except OSError:
         pass
 
-    cmd = ["hashcat", "-m", "22000", "-a", "0",
+    cmd = ["hashcat", "-m", "22000", "-a", "3" if mask else "0",
            "--outfile", out_file, "--outfile-format", "2"]
     if extra_args:
         cmd += list(extra_args)
-    cmd += [hash_file, wordlist]
+    if rules and not mask:
+        cmd += ["-r", rules]
+    if mask:
+        if custom:
+            for flag in sorted(custom):
+                cmd += [flag, custom[flag]]
+        if increment:
+            cmd += ["--increment", "--increment-min", "1"]
+        cmd += [hash_file, mask]
+    else:
+        cmd += [hash_file, wordlist]
     info(f"testando senhas (hashcat): {' '.join(cmd)}")
     print(paint("-" * 60, Color.CYAN))
 
@@ -828,6 +861,194 @@ def crack(cap_file, wordlist, bssid):
     return chave
 
 
+# ---------------------------------------------------------------------------
+# Pipeline de quebra: mascaras, estimativa de tempo e frentes em fila
+# ---------------------------------------------------------------------------
+
+def _charset_size(cs):
+    """Tamanho de um charset do hashcat (ex.: '?l?d' = 36, 'abc' = 3)."""
+    total = 0
+    i = 0
+    while i < len(cs):
+        if cs[i] == "?" and i + 1 < len(cs):
+            tok = cs[i:i + 2]
+            total += CHARSET_SIZES.get(tok, 1)
+            i += 2
+            continue
+        total += 1
+        i += 1
+    return total
+
+
+def mask_keyspace(mask, custom=None, increment=False):
+    """Espaco de busca de uma mascara hashcat (numero de combinacoes)."""
+    tamanhos = dict(CHARSET_SIZES)
+    if custom:
+        for flag, cs in custom.items():
+            # no hashcat o charset -1 e referenciado na mascara como ?1
+            token = "?" + flag.lstrip("-")
+            tamanhos[token] = max(1, _charset_size(cs))
+
+    def _tokens(m):
+        toks = []
+        i = 0
+        while i < len(m):
+            if m[i] == "?" and i + 1 < len(m):
+                toks.append(m[i:i + 2])  # token inteiro: ?d, ?l, ?1...
+                i += 2
+            else:
+                toks.append(m[i])  # literal = posicao fixa
+                i += 1
+        return toks
+
+    def _calc_toks(toks):
+        total = 1
+        for t in toks:
+            if t in tamanhos:
+                total *= tamanhos[t]
+        return total
+
+    toks = _tokens(mask)
+    if increment:
+        # --increment testa de 1 ate o tamanho cheio, sempre por token
+        return sum(_calc_toks(toks[:n]) for n in range(1, len(toks) + 1))
+    return _calc_toks(toks)
+
+
+def parse_masks(spec):
+    """Expande presets e mascaras crus. Devolve [(nome, mask, custom, incr)]."""
+    itens = []
+    for tok in [t.strip() for t in (spec or "").split(",") if t.strip()]:
+        if tok in MASK_PRESETS:
+            itens.extend(MASK_PRESETS[tok])
+        else:
+            itens.append((tok, tok, None, False))
+    return itens
+
+
+def count_lines(path):
+    n = 0
+    try:
+        with open(path, "rb") as fh:
+            for _ in fh:
+                n += 1
+    except OSError:
+        pass
+    return n
+
+
+def fmt_tempo(segundos):
+    if not segundos or segundos < 1:
+        return "<1s"
+    if segundos < 60:
+        return f"{int(segundos)}s"
+    if segundos < 3600:
+        return f"{segundos / 60:.0f}min"
+    if segundos < 86400:
+        return f"{segundos / 3600:.1f}h"
+    return f"{segundos / 86400:.1f}dias"
+
+
+def print_estimate(frentes, hspeed):
+    """Mostra o espaco de busca e o tempo estimado de cada frente."""
+    print()
+    print(paint("  Frente                         Espaco      Tempo estimado", Color.BOLD))
+    print("  " + "-" * 66)
+    total = 0
+    for f in frentes:
+        ks = f.get("keyspace") or f.get("senhas") or 0
+        total += ks
+        tempo = fmt_tempo(ks / hspeed) if hspeed else "?"
+        nome = f["nome"][:31]
+        print("  %-32s %13s %15s" % (nome, "{:,}".format(ks).replace(",", "."), tempo))
+    print("  " + "-" * 66)
+    print("  %-32s %13s %15s" % ("TOTAL", "{:,}".format(total).replace(",", "."),
+                                 fmt_tempo(total / hspeed) if hspeed else "?"))
+    info("calculo com %s hashes/s (ajuste com --hspeed ou meca com --bench)" %
+         ("{:,}".format(int(hspeed)).replace(",", ".") if hspeed else "?"))
+    print()
+
+
+def benchmark_speed():
+    """Mede a velocidade real do hashcat no modo 22000 (hashcat -b)."""
+    if not shutil.which("hashcat"):
+        return None
+    info("medindo a velocidade real do hashcat (hashcat -b -m 22000, pode demorar)...")
+    rc, out = run(["hashcat", "-b", "-m", "22000"], timeout=300)
+    m = re.search(r"Speed\.#\S*:\s*([\d.]+)\s*([kMG]?H)/s", out)
+    if not m:
+        return None
+    mult = {"": 1, "k": 1e3, "M": 1e6, "G": 1e9}.get(m.group(2), 1)
+    return float(m.group(1)) * mult
+
+
+def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
+    """Roda as frentes de quebra em fila, da mais barata a mais cara.
+
+    Frente 1: wordlist (opcionalmente com regras --rules)
+    Frentes seguintes: mascaras hashcat (-a 3) de --masks
+    + frente de incremento numerico com --increment.
+    Ctrl+C pula para a proxima frente.
+    Devolve a chave ou None.
+    """
+    tem_hashcat = bool(cracker == "hashcat" and shutil.which("hashcat")
+                       and os.path.isfile(hash_file))
+    if cracker == "hashcat" and not tem_hashcat:
+        warn("hashcat ou hashes 22000 indisponiveis; somente a wordlist sera testada")
+
+    frentes = []
+    nome_wl = os.path.basename(wordlist) if wordlist else "(sem wordlist)"
+    frentes.append({"nome": "wordlist %s%s" % (nome_wl, " + regras" if args.rules else ""),
+                    "senhas": count_lines(wordlist) if wordlist else 0,
+                    "tipo": "wordlist"})
+
+    masks = parse_masks(args.masks)
+    if args.increment:
+        masks.append(("incremento 1..8", "?d" * 8, None, True))
+    if masks and not tem_hashcat:
+        warn("frentes de mascara ignoradas: instale o hashcat (sudo apt install hashcat)")
+    for nome, mask, custom, incr in masks:
+        if not tem_hashcat:
+            break
+        frentes.append({"nome": "mascara %s" % nome, "tipo": "mascara",
+                        "keyspace": mask_keyspace(mask, custom, incr),
+                        "mask": mask, "custom": custom, "increment": incr})
+
+    hspeed = args.hspeed
+    if args.bench:
+        medido = benchmark_speed()
+        if medido:
+            hspeed = medido
+            ok("velocidade medida: %s hashes/s" %
+               "{:,}".format(int(hspeed)).replace(",", "."))
+        else:
+            warn("nao foi possivel medir a velocidade; usando o valor de --hspeed")
+
+    print_estimate(frentes, hspeed)
+
+    for f in frentes:
+        info(f"abrindo frente: {f['nome']}  (Ctrl+C pula para a proxima)")
+        chave = None
+        if f["tipo"] == "wordlist":
+            if tem_hashcat:
+                chave = crack_hashcat(hash_file, wordlist,
+                                      shlex.split(args.hashcat_args or ""),
+                                      rules=args.rules)
+            else:
+                if args.rules:
+                    warn("--rules ignorado: aircrack-ng nao entende regras do hashcat")
+                chave = crack(cap_file, wordlist, bssid)
+        else:
+            chave = crack_hashcat(hash_file, None,
+                                  shlex.split(args.hashcat_args or ""),
+                                  mask=f["mask"], custom=f["custom"],
+                                  increment=f["increment"])
+        if chave:
+            return chave
+        info(f"frente {f['nome']} esgotada")
+    return None
+
+
 def save_result(out_dir, bssid, essid, key):
     path = os.path.join(out_dir, "resultado_%s.txt" % time.strftime("%Y%m%d_%H%M%S"))
     try:
@@ -929,6 +1150,17 @@ def build_parser():
                    help="quebrador WPA (auto: hashcat se houver hash PMKID/EAPOL extraido)")
     p.add_argument("--hashcat-args", default="",
                    help="argumentos extras do hashcat entre aspas, ex: '--force -D 1'")
+    p.add_argument("--masks", default="numeric8",
+                   help="frentes de mascara: presets numeric6/7/8/9/10, factory, alnum8 "
+                        "ou mascaras crus (?d?d?l?l) separadas por virgula")
+    p.add_argument("--increment", action="store_true",
+                   help="adiciona a frente de incremento numerico (1 ate 8 digitos)")
+    p.add_argument("--rules",
+                   help="regras do hashcat, ex: /usr/share/hashcat/rules/best64.rule")
+    p.add_argument("--hspeed", type=float, default=150000,
+                   help="hashes/s usados na estimativa de tempo (padrao = GPU intermediaria)")
+    p.add_argument("--bench", action="store_true",
+                   help="mede a velocidade real do hashcat antes de estimar")
     p.add_argument("--out", default="captures", help="pasta para capturas e resultados")
     p.add_argument("--no-crack", action="store_true", help="para apos a captura, sem testar senhas")
     p.add_argument("--keep", action="store_true", help="nao restaura a interface ao final")
@@ -1089,12 +1321,9 @@ def main(argv=None):
                     warn("nenhum hash PMKID/EAPOL extraido; usando aircrack-ng no .cap")
                     cracker = "aircrack"
 
-            if cracker == "hashcat":
-                if pmkid_n and not eapol_n:
-                    ok("sem 4-way handshake visivel; quebrando via PMKID")
-                found_key = crack_hashcat(hash_file, wordlist, shlex.split(args.hashcat_args or ""))
-            else:
-                found_key = crack(cap_file, wordlist, bssid)
+            if cracker == "hashcat" and pmkid_n and not eapol_n:
+                ok("sem 4-way handshake visivel; quebrando via PMKID")
+            found_key = crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args)
 
         if found_key:
             ok(paint("CHAVE ENCONTRADA: %s" % found_key, Color.BOLD + Color.GREEN))

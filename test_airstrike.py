@@ -156,6 +156,41 @@ try:
 finally:
     m.run = orig_run
 
+# ---------------------------------------------------------------------------
+# Pipeline de quebra: mascaras e estimativa
+# ---------------------------------------------------------------------------
+check("keyspace numeric8 = 10^8", m.mask_keyspace("?d" * 8) == 10 ** 8)
+check("keyspace alnum8 = 62^8", m.mask_keyspace("?1" * 8, {"-1": "?l?u?d"}) == 62 ** 8)
+check("keyspace charset 36 = 36^8", m.mask_keyspace("?1" * 8, {"-1": "?l?d"}) == 36 ** 8)
+check("charset ?l?d = 36", m._charset_size("?l?d") == 36)
+check("charset literal abc = 3", m._charset_size("abc") == 3)
+check("keyspace incremento 1..8",
+      m.mask_keyspace("?d" * 8, None, True) == sum(10 ** k for k in range(1, 9)))
+check("keyspace mascara mista", m.mask_keyspace("?d?d?l?l") == 10 * 10 * 26 * 26)
+check("keyspace com literais", m.mask_keyspace("ab?d?d") == 100)
+check("parse_masks preset", m.parse_masks("numeric8")[0] == ("numeric8", "?d" * 8, None, False))
+check("parse_masks cru", m.parse_masks("?l?l?d?d")[0][1] == "?l?l?d?d")
+check("parse_masks vazio", m.parse_masks("") == [])
+check("parse_masks dois presets", len(m.parse_masks("numeric8,factory")) == 4)
+check("fmt_tempo segundos", m.fmt_tempo(45) == "45s")
+check("fmt_tempo minutos", m.fmt_tempo(120) == "2min")
+check("fmt_tempo horas", m.fmt_tempo(3600 * 2.5) == "2.5h")
+check("fmt_tempo dias", m.fmt_tempo(86400 * 2) == "2.0dias")
+check("estimate imprime sem excecao",
+      m.print_estimate([{"nome": "wordlist rockyou.txt", "senhas": 14344392, "tipo": "wordlist"},
+                        {"nome": "mascara numeric8", "keyspace": 10 ** 8, "tipo": "mascara"}],
+                       150000) is None)
+check("benchmark sem hashcat devolve None", m.benchmark_speed() is None or
+      isinstance(m.benchmark_speed(), float))
+
+a3 = p.parse_args(["--masks", "numeric8,factory", "--increment", "--bench", "--hspeed", "250000"])
+check("argparse masks", a3.masks == "numeric8,factory")
+check("argparse increment", a3.increment is True)
+check("argparse bench", a3.bench is True)
+check("argparse hspeed", a3.hspeed == 250000.0)
+check("argparse rules padrao None", a3.rules is None)
+check("argparse masks padrao numeric8", p.parse_args([]).masks == "numeric8")
+
 print()
 print("FALHAS: %d" % len(fails))
 sys.exit(1 if fails else 0)
