@@ -342,7 +342,7 @@ def scan_networks(monitor_iface, seconds, out_dir):
     """Roda o airodump-ng por N segundos e devolve as redes encontradas."""
     prefix = os.path.join(out_dir, "scan_%s" % time.strftime("%Y%m%d_%H%M%S"))
     cmd = ["airodump-ng", "--output-format", "csv", "-w", prefix, monitor_iface]
-    info(f"varrendo redes por {seconds}s ({' '.join(cmd)})")
+    info(f"varrendo redes por {seconds}s (ou ate Ctrl+C para parar e escolher)")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
@@ -350,6 +350,8 @@ def scan_networks(monitor_iface, seconds, out_dir):
         sys.exit(1)
     try:
         time.sleep(seconds)
+    except KeyboardInterrupt:
+        warn("varredura interrompida; mostrando as redes ja capturadas...")
     finally:
         _stop_process(proc)
 

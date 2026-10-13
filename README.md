@@ -66,7 +66,11 @@ chmod +x airstrike.py
 sudo python3 airstrike.py
 ```
 
-O modo interativo mostra a tabela de redes e pede o número do alvo.
+O modo interativo varre automaticamente por `--scan-time` segundos (ou até
+`Ctrl+C`, igual ao Wifite), mostra a tabela de redes e pede o número do alvo.
+A partir daí tudo roda sozinho: captura, deauth, detecção de handshake/PMKID
+e quebra da senha — `Ctrl+C` durante a captura pula direto para a tentativa
+de quebra com o que já foi capturado.
 
 ### Exemplos não interativos
 
