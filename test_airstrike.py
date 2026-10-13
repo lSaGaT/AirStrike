@@ -116,6 +116,46 @@ try:
 except SystemExit:
     check("argparse cracker invalido rejeitado", True)
 
+# ---------------------------------------------------------------------------
+# Deteccao de interface e recuperacao automatica do adaptador
+# ---------------------------------------------------------------------------
+FAKE_IW_MANAGED = "phy#0\n\tInterface wlan0\n\t\tifindex 3\n\t\ttype managed\n"
+FAKE_IW_MONITOR = "phy#0\n\tInterface wlan0mon\n\t\tifindex 4\n\t\ttype monitor\n"
+FAKE_IW_EMPTY = ""
+
+
+def fake_run_factory(iw_output):
+    def _fake(cmd, timeout=None, stdin=None):
+        if len(cmd) >= 2 and cmd[0] == "iw" and cmd[1] == "dev":
+            return 0, iw_output
+        return 1, "comando nao suportado no teste"
+    return _fake
+
+
+orig_run = m.run
+try:
+    m.run = fake_run_factory(FAKE_IW_MANAGED)
+    check("iw: parseia managed", m.list_ifaces_with_type() == {"wlan0": "managed"})
+    check("find_wireless_iface acha managed", m.find_wireless_iface() == "wlan0")
+    ad = m.Adapter()
+    ad.monitor = "wlan0mon"
+    check("alive False quando a interface nao existe", ad.alive() is False)
+
+    m.run = fake_run_factory(FAKE_IW_MONITOR)
+    check("iw: parseia monitor", m.list_ifaces_with_type() == {"wlan0mon": "monitor"})
+    ad.monitor = "wlan0mon"
+    check("alive True em modo monitor", ad.alive() is True)
+    ad.monitor = "wlan0"
+    check("alive False com tipo errado", ad.alive() is False)
+
+    m.run = fake_run_factory(FAKE_IW_EMPTY)
+    check("alive False sem interfaces", ad.alive() is False)
+
+    # setup_monitor com fatal=False devolve None em vez de sair do programa
+    check("setup_monitor fatal=False devolve None", m.setup_monitor(None, fatal=False) is None)
+finally:
+    m.run = orig_run
+
 print()
 print("FALHAS: %d" % len(fails))
 sys.exit(1 if fails else 0)

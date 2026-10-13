@@ -51,6 +51,22 @@ mensagem EAPOL enviada pelo roteador, entao funciona melhor em redes com
 poucos clientes conectados. O AirStrike detecta os dois e escolhe o
 caminho automaticamente.
 
+## Adaptador caiu? Ela religa sozinho
+
+O nome da interface e sempre detectado automaticamente, sem voce digitar
+nada. E se a placa Wi-Fi cair no meio do teste (USB removido e recolocado,
+driver reiniciado, modo monitor perdido, airodump-ng morrendo)? O AirStrike
+fica vigiando a cada 2 segundos e, ao detectar a queda, executa sozinho:
+
+```bash
+sudo airmon-ng check kill
+sudo airmon-ng start NOME_DA_INTERFACE_DETECTADA
+```
+
+Depois de religar, ele reinicia a captura e continua o teste de onde parou.
+A vigilancia vale durante a varredura e durante a captura. Se a placa nao
+voltar em 60 segundos, ele avisa e encerra restaurando a rede normal.
+
 ## Aviso legal
 
 Use apenas em redes proprias ou com autorizacao explicita do responsavel.
