@@ -148,6 +148,15 @@ sudo airstrike --wordlist /caminho/senhas.txt --deauth 0
 
 # So capturar, sem testar senhas
 sudo airstrike --bssid AA:BB:CC:DD:EE:FF --no-crack
+
+# Quebrar uma captura que ja existe, sem ligar antena nenhuma
+sudo airstrike --crack captures/captura_20261015_115942-01.cap
+
+# Evil twin com portal cativo (hostapd + dnsmasq) apos o handshake
+sudo airstrike --eviltwin
+
+# So a captura dirigida, sem WPS pixie e sem PMKID dedicado
+sudo airstrike --no-wps --pmkid-time 0
 ```
 
 ### Opcoes
@@ -155,6 +164,7 @@ sudo airstrike --bssid AA:BB:CC:DD:EE:FF --no-crack
 | Opcao | Padrao | Descricao |
 |-------|--------|-----------|
 | `--iface` | auto | placa wireless para o modo monitor |
+| `--iface-inject` | a da captura | 2a antena so para injecao/deauth |
 | `--monitor` | nada | interface que ja esta em modo monitor |
 | `--scan-time` | 15 | segundos de varredura |
 | `--bssid` | nada | BSSID do alvo, pula o menu |
@@ -174,6 +184,13 @@ sudo airstrike --bssid AA:BB:CC:DD:EE:FF --no-crack
 | `--out` | captures | pasta das capturas e resultados |
 | `--no-crack` | nada | para apos a captura, sem testar senhas |
 | `--keep` | nada | nao restaura a placa ao final |
+| `--crack` | nada | quebra sobre captura ja feita (.cap, prefixo ou .22000) |
+| `--pmkid-time` | 45 | segundos de PMKID dedicado (hcxdumptool) antes da captura, 0 desativa |
+| `--no-wps` | nada | nao tenta WPS Pixie Dust no alvo |
+| `--pixie-time` | 90 | tempo maximo do Pixie Dust em segundos, 0 desativa |
+| `--eviltwin` | nada | AP clonado com portal cativo apos o handshake |
+| `--portal-port` | 80 | porta do portal cativo |
+| `--portal-time` | 900 | tempo maximo do portal cativo em segundos |
 | `--yes` | nada | pula o aviso de autorizacao |
 
 Com `--cracker auto`, se o hcxpcapngtool extrair algum hash PMKID ou
@@ -233,6 +250,55 @@ intermedia testa ~150 mil senhas por segundo, ou seja, cai em ~11
 minutos. Ja 8 posicoes com letras e digitos (62^8) sao 218 bilhoes,
 que e assunto para dias de GPU. Por isso a fila sempre comeca pelo
 conjunto menor.
+
+## Cadeia de ataque: WPS, PMKID dedicado e evil twin
+
+Cada alvo passa por uma cadeia da tentativa mais barata para a mais
+cara, e o fluxo para na primeira que funcionar:
+
+1. **WPS Pixie Dust** — o wash verifica o estado do WPS do alvo; se
+   estiver aberto, o reaver (ou bully) tenta a quebra instantanea.
+   Se vier so o PIN WPS, o comando para continuar aparece na tela.
+2. **PMKID dedicado** — o hcxdumptool fica no canal do alvo atras de
+   hash, sem deauth e sem precisar de cliente conectado. Conseguindo
+   hash, a captura dirigida e pulada por inteiro.
+3. **Captura dirigida** — airodump-ng + deauth, o fluxo classico.
+
+### Usar uma captura que ja existe
+
+No inicio do programa, se ja houver capturas na pasta, a ferramenta
+pergunta se voce quer quebrar uma delas em vez de capturar de novo
+(s/n). Tambem da para ir direto:
+
+```bash
+sudo airstrike --crack captures/captura_20261015_115942-01.cap
+```
+
+Aceita o .cap da sessao, o prefixo dela ou um .22000 direto. A
+ferramenta lista as redes dentro da captura, marca quem tem
+handshake e vai direto para as frentes de quebra, sem ligar antena.
+
+### Evil twin com portal cativo
+
+`--eviltwin` exige um handshake valido primeiro: e contra ele que
+cada senha digitada no portal e conferida. Depois da captura, a
+ferramenta sobe um AP aberto clonado com o ESSID do alvo (hostapd),
+distribui IP e prende o DNS pelo dnsmasq e serve um portal no estilo
+"atualizacao de roteador" na porta 80. Quando uma senha digitada
+bate no handshake, a chave e salva e tudo e restaurado.
+
+Requer hostapd e dnsmasq (`sudo apt install hostapd dnsmasq`). A
+internet do notebook fica fora durante o portal (de proposito) e
+volta no final. O deauth usa um monitor virtual na mesma antena do
+AP; se o driver recusar, o portal segue sem deauth automatico.
+
+### Hashcat em maquina sem GPU
+
+Se o hashcat reclamar de "No OpenCL", instale um backend de CPU:
+`sudo apt install pocl-opencl-icd`. A ferramenta detecta esse caso
+antes de quebrar e avisa, em vez de fingir que testou senhas. Em CPU
+o rendimento do WPA2 e baixo (poucos milhares de hashes/s): use
+`--bench` para estimar os tempos com numeros reais.
 
 ## Arquivos gerados
 

