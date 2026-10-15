@@ -230,6 +230,21 @@ def chipset_do_iface(nome):
                     if descr:
                         partes.append(descr)
                     break
+        elif modalias.startswith("pci:"):
+            mp = re.search(r"pci:v([0-9A-Fa-f]{8})d([0-9A-Fa-f]{8})", modalias)
+            if mp:
+                chave = "%04x:%04x" % (int(mp.group(1), 16), int(mp.group(2), 16))
+                rc, out = run(["lspci", "-nn"])
+                if rc == 0:
+                    for linha in out.splitlines():
+                        if chave in linha.lower():
+                            m2 = re.search(r"\]:\s*(.+)$", linha)
+                            if m2:
+                                nome = re.split(r"\s+\[[0-9a-fA-F]{4}:[0-9a-fA-F]{4}\]",
+                                                m2.group(1))[0].strip()
+                                if nome:
+                                    partes.append(nome)
+                            break
     except OSError:
         pass
     return ", ".join(partes)
@@ -248,7 +263,7 @@ def find_wireless_iface():
 
 
 def escolher_adaptadores(args):
-    """No estilo wifite: mostra os adaptadores e pergunta qual usar.
+    """No estilo wifite: tabela numerada dos adaptadores e pergunta qual usar.
 
     Com um so adaptador (ou sem terminal interativo) nao pergunta nada.
     Preenche args.iface (captura) e args.iface_inject (injecao/deauth)
@@ -257,44 +272,57 @@ def escolher_adaptadores(args):
     ifaces = list_ifaces_with_type()
     if not ifaces:
         return
+    nomes = sorted(ifaces)
     chips = {n: chipset_do_iface(n) for n in ifaces}
 
-    def rotulo(n):
-        chip = chips.get(n)
-        return f"{n} ({ifaces[n]}, {chip})" if chip else f"{n} ({ifaces[n]})"
+    info("adaptadores sem fio detectados:")
+    print(paint("  #   Interface  Estado    Chipset", Color.CYAN))
+    print("  " + "-" * 74)
+    for i, n in enumerate(nomes, 1):
+        chip = chips.get(n) or "-"
+        if len(chip) > 68:
+            chip = chip[:65] + "..."
+        print("  %-3d %-10s %-9s %s" % (i, n, ifaces[n], chip))
+    print("  " + "-" * 74)
 
-    lista = ", ".join(rotulo(n) for n in sorted(ifaces))
-    info(f"adaptadores sem fio detectados: {lista}")
-    nomes = sorted(ifaces)
     if not sys.stdin.isatty() or len(nomes) < 2:
         return
-    if not args.iface:
+
+    def perguntar(texto):
         try:
-            resp = input(f"Adaptador para CAPTURA (Enter = auto; opcoes: "
-                         f"{', '.join(rotulo(n) for n in nomes)}): ").strip()
+            resp = input(texto).strip().lower()
         except (EOFError, KeyboardInterrupt):
             print()
-            resp = ""
-        if resp and resp in nomes:
-            args.iface = resp
-        elif resp:
-            warn(f"'{resp}' nao existe; seguindo com auto-deteccao")
+            return None
+        if not resp:
+            return None
+        if resp in nomes:
+            return resp
+        if resp.isdigit() and 1 <= int(resp) <= len(nomes):
+            return nomes[int(resp) - 1]
+        warn("'%s' nao esta na lista" % resp)
+        return None
+
+    if not args.iface:
+        escolha = perguntar("Adaptador para CAPTURA (numero ou nome, "
+                            "Enter = auto): ")
+        if escolha:
+            args.iface = escolha
+            info("captura em %s (%s)" % (escolha,
+                                         chips.get(escolha) or "chip desconhecido"))
     if not args.iface_inject:
         base_captura = iface_base(args.iface) if args.iface else None
-        outras = [n for n in nomes if iface_base(n) != base_captura]
-        if not outras:
-            return
-        try:
-            resp = input(f"Adaptador para INJECAO/deauth "
-                         f"(Enter = mesmo da captura; opcoes: "
-                         f"{', '.join(rotulo(n) for n in outras)}): ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            resp = ""
-        if resp and resp in nomes:
-            args.iface_inject = resp
-        elif resp:
-            warn(f"'{resp}' nao existe; injecao no mesmo adaptador da captura")
+        if args.iface and all(iface_base(n) == base_captura for n in nomes):
+            return  # so existe a phy da captura; a injecao sera nela mesma
+        dica = ""
+        if args.iface:
+            dica = " [captura: %s]" % args.iface
+        escolha = perguntar("Adaptador para INJECAO/deauth (numero ou nome, "
+                            "Enter = mesmo da captura%s): " % dica)
+        if escolha:
+            args.iface_inject = escolha
+            info("injecao em %s (%s)" % (escolha,
+                                         chips.get(escolha) or "chip desconhecido"))
 
 
 def setup_monitor(iface=None, fatal=True, matar_processos=True):
