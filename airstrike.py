@@ -561,30 +561,96 @@ def _power_int(texto):
     return v if v != 0 else -999
 
 
+def _carregar_scan(csv_path):
+    """Le o CSV parcial do airodump-ng; redes ordenadas da mais forte pra fraca."""
+    redes, _ = parse_airodump_csv(csv_path)  # ja junta a contagem de clientes
+    redes.sort(key=lambda r: _power_int(r["power"]), reverse=True)
+    return redes
+
+
+def _varredura_ao_vivo(csv_path, seconds):
+    """Tabela viva estilo wifite: potencia e clientes atualizando a cada
+    segundo, da rede mais forte pra mais fraca. Ctrl+C interrompe e volta
+    pro fluxo normal (a tabela final e impressa pelo print_networks)."""
+    from rich import box
+    from rich.console import Console
+    from rich.live import Live
+    from rich.table import Table as RichTable
+    from rich.text import Text
+
+    try:
+        linhas_term = os.get_terminal_size().lines
+    except OSError:
+        linhas_term = 24
+    limite = max(6, linhas_term - 9)
+
+    def render(redes, decorrido, total):
+        t = RichTable(box=box.SIMPLE, header_style="bold cyan", expand=False)
+        t.add_column("#", justify="right")
+        t.add_column("BSSID")
+        t.add_column("CH", justify="right")
+        t.add_column("POW", justify="right")
+        t.add_column("CLI", justify="right")
+        t.add_column("ENC")
+        t.add_column("ESSID")
+        for i, r in enumerate(redes, 1):
+            p = _power_int(r["power"])
+            cor = "bold green" if p >= -50 else ("yellow" if p >= -65 else "red")
+            cli = r.get("clients") or 0
+            t.add_row(
+                str(i), r["bssid"], str(r["channel"]),
+                Text(str(r["power"] or "?"), style=cor),
+                Text(str(cli) if cli else "--",
+                     style="bold green" if cli else "dim"),
+                r["privacy"] or "?",
+                Text(r["essid"] or "<oculta>",
+                     style="cyan" if r["essid"] else "yellow"))
+        t.caption = ("varrendo ha %ds | %d redes%s | Ctrl+C para parar e "
+                     "escolher o alvo" %
+                     (decorrido, total,
+                      "" if total <= limite else " (mostrando as %d mais fortes)"
+                      % limite))
+        return t
+
+    t0 = time.time()
+    with Live(console=Console(), transient=True, refresh_per_second=2) as live:
+        while True:
+            redes = _carregar_scan(csv_path)
+            live.update(render(redes[:limite], int(time.time() - t0), len(redes)))
+            if time.time() - t0 >= seconds:
+                break
+            time.sleep(1)
+
+
 def scan_networks(monitor_iface, seconds, out_dir):
-    """Roda o airodump-ng por N segundos e devolve as redes encontradas."""
+    """Roda o airodump-ng por N segundos e devolve as redes encontradas.
+
+    Em terminal interativo mostra a tabela AO VIVO (potencia e clientes
+    atualizando); Ctrl+C para antes do tempo e vai direto pra escolha do alvo.
+    """
     prefix = os.path.join(out_dir, "scan_%s" % time.strftime("%Y%m%d_%H%M%S"))
     cmd = ["airodump-ng", "--output-format", "csv", "-w", prefix, monitor_iface]
-    info(f"varrendo redes por {seconds}s (ou ate Ctrl+C para parar e escolher)")
+    info(f"varrendo redes por {seconds}s (Ctrl+C para parar e escolher)")
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
         err(f"falha ao iniciar o airodump-ng: {exc}")
         sys.exit(1)
+    csv_path = prefix + "-01.csv"
     try:
-        time.sleep(seconds)
+        if sys.stdout.isatty() and seconds > 0:
+            _varredura_ao_vivo(csv_path, seconds)
+        else:
+            time.sleep(seconds)
     except KeyboardInterrupt:
         warn("varredura interrompida; mostrando as redes ja capturadas...")
     finally:
         _stop_process(proc)
 
-    csv_path = prefix + "-01.csv"
     if not os.path.exists(csv_path):
         err(f"o airodump-ng nao gerou o arquivo {csv_path}")
         sys.exit(1)
-    redes, _ = parse_airodump_csv(csv_path)
-    redes.sort(key=lambda r: _power_int(r["power"]), reverse=True)
-    return redes
+    return _carregar_scan(csv_path)
 
 
 def print_networks(redes):
@@ -592,13 +658,15 @@ def print_networks(redes):
         warn("nenhuma rede encontrada. Aumente o tempo (--scan-time) ou verifique a antena.")
         return
     print()
-    print(paint("  #   BSSID              CH   POW    ENC            ESSID", Color.BOLD))
+    print(paint("  #   BSSID              CH   POW  CLI  ENC            ESSID", Color.BOLD))
     print("  " + "-" * 68)
     for i, r in enumerate(redes, 1):
         essid = r["essid"] or paint("<oculta>", Color.YELLOW)
         enc = (r["privacy"] or "?").strip()
-        print("  %-3d %-18s %-4s %-6s %-14s %s" % (
-            i, r["bssid"], r["channel"], r["power"] or "?", enc, essid))
+        cli = r.get("clients") or 0
+        print("  %-3d %-18s %-4s %-6s %-4s %-14s %s" % (
+            i, r["bssid"], r["channel"], r["power"] or "?",
+            str(cli) if cli else "--", enc, essid))
     print()
 
 

@@ -53,6 +53,12 @@ check("ESSID com virgula", redes[1]["essid"] == "Rede, Com, Virgula")
 check("ESSID oculto vazio", redes[2]["essid"] == "")
 check("enc WEP", "WEP" in redes[2]["privacy"])
 check("2 clientes no alvo", redes[0]["clients"] == 2)
+
+ordem = m._carregar_scan(path)
+check("carregar_scan ordena por potencia",
+      [r["essid"] for r in ordem] == ["MinhaCasa", "CorpWiFi", "Rede, Com, Virgula", ""])
+check("carregar_scan mantem clientes", ordem[0]["clients"] == 2)
+check("print_networks com coluna CLI", m.print_networks(ordem) is None)
 check("sem clientes na rede oculta", redes[2]["clients"] == 0)
 check("auth MGT detectada", "MGT" in redes[3]["auth"])
 

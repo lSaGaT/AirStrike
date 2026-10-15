@@ -19,7 +19,9 @@ O AirStrike executa sozinho todas as etapas de um teste de Wi-Fi:
 
 1. Mostra o aviso legal e confirma que voce tem autorizacao para testar
 2. Coloca a placa de rede em modo monitor
-3. Varre as redes proximas e mostra a lista na tela
+3. Varre as redes proximas e mostra a tabela ao vivo, da mais forte pra
+   mais fraca, com potencia do sinal e numero de clientes atualizando
+   a cada segundo (Ctrl+C para parar e escolher)
 4. Voce escolhe a rede alvo pelo numero da lista ou pelo BSSID
 5. Captura os pacotes somente da rede alvo
 6. Envia pacotes de desconexao para forcar a reconexao de um cliente
