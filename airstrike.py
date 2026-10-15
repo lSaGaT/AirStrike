@@ -21,6 +21,7 @@ Nenhuma dependência externa de Python (somente biblioteca padrão).
 """
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -868,8 +869,155 @@ def extract_22000(cap_file, out_file, bssid=None):
     return count_hashes_in_22000(out_file, bssid)
 
 
+def _fmt_num(n):
+    """1234567 -> '1.234.567'."""
+    try:
+        return "{:,}".format(int(n)).replace(",", ".")
+    except (TypeError, ValueError):
+        return str(n)
+
+
+def _fmt_vel(n):
+    """4036 -> '4.0 kH/s'."""
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1e9:
+        return "%.1f GH/s" % (n / 1e9)
+    if n >= 1e6:
+        return "%.1f MH/s" % (n / 1e6)
+    if n >= 1e3:
+        return "%.1f kH/s" % (n / 1e3)
+    return "%.0f H/s" % n
+
+
+class PainelHashcat:
+    """Painel ao vivo da quebra, alimentado pelo --status-json do hashcat.
+
+    Com rich e terminal interativo: painel permanente com barra de
+    progresso, contador de senhas, velocidade, ETA e temperatura.
+    Sem rich, mas em terminal: contador em uma linha (\\r).
+    Sem terminal (logs, pipes): desligado — o filtro de texto assume.
+    """
+
+    def __init__(self, rotulo=None, ataque=None, total=None):
+        self.rotulo = rotulo
+        self.ataque = ataque
+        self.total = total
+        self.estado = {}
+        self._aviso_linhas = []
+        self._live = None
+        self._console = None
+        self._rich = False
+        try:
+            if sys.stdout.isatty():
+                from rich.console import Console
+                from rich.live import Live
+                self._Console, self._Live = Console, Live
+                self._console = Console(highlight=False)
+                self._rich = True
+        except ImportError:
+            self._rich = False
+        self.ativo = sys.stdout.isatty()
+
+    # -- alimentacao ------------------------------------------------------
+    def linha_json(self, obj):
+        # no --status-json do hashcat os campos ficam no nivel de cima;
+        # a chave "status" e um escalar (estado da sessao), nao um dict
+        self.estado = obj if isinstance(obj, dict) else {}
+        if self._live is not None:
+            self._live.update(self._render())
+
+    def aviso(self, texto):
+        if self._live is not None:
+            self._live.console.print(texto, style="yellow", highlight=False)
+        else:
+            print(texto)
+
+    # -- contexto ---------------------------------------------------------
+    def __enter__(self):
+        if self._rich and self.ativo:
+            self._live = self._Live(self._render(), console=self._console,
+                                    refresh_per_second=2, transient=False)
+            self._live.__enter__()
+        return self
+
+    def __exit__(self, *exc):
+        if self._live is not None:
+            self._live.__exit__(*exc)
+        return False
+
+    # -- render -----------------------------------------------------------
+    def _linha(self, grade, nome, valor):
+        grade.add_row(nome, valor)
+
+    def _render(self):
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+
+        s = self.estado
+        g = Table.grid(padding=(0, 2))
+        g.add_column(justify="right", style="bold cyan", no_wrap=True)
+        g.add_column()
+        self._linha(g, "Alvo", self.rotulo or "-")
+        self._linha(g, "Ataque", self.ataque or "-")
+
+        devs = s.get("devices") or []
+        vel = sum((d.get("speed") or 0) for d in devs)
+        dev_txt = []
+        for d in devs[:2]:
+            nome = (d.get("device_name") or "?")
+            nome = re.sub(r"^cpu-[a-z0-9]+-", "", nome)
+            partes = ["%s %s" % (d.get("device_type") or "?", nome[:30])]
+            if d.get("util") not in (None, -1):
+                partes.append("%s%%" % d.get("util"))
+            if d.get("temp") not in (None, -1, 0):
+                partes.append("%s C" % d.get("temp"))
+            dev_txt.append(" · ".join(partes))
+        self._linha(g, "Backend", " | ".join(dev_txt) or "-")
+        self._linha(g, "Velocidade", _fmt_vel(vel) if devs else "-")
+
+        prog = s.get("progress") or []
+        testadas = prog[0] if prog else None
+        total = prog[1] if len(prog) > 1 else self.total
+        if testadas is None:
+            self._linha(g, "Testadas", "-")
+        elif total:
+            pct = min(100.0, 100.0 * testadas / float(total))
+            cheio = int(30 * pct / 100.0)
+            barra = Text()
+            barra.append("█" * cheio, style="green")
+            barra.append("░" * (30 - cheio), style="dim")
+            barra.append(" %4.1f%%" % pct)
+            self._linha(g, "Testadas",
+                        "%s / %s" % (_fmt_num(testadas), _fmt_num(total)))
+            self._linha(g, "", barra)
+        else:
+            self._linha(g, "Testadas", _fmt_num(testadas))
+
+        rec_hash = (s.get("recovered_hashes") or [0])
+        rec_salt = (s.get("recovered_salts") or [0])
+        rec = (rec_hash[0] if rec_hash else 0) + (rec_salt[0] if rec_salt else 0)
+        estilo = "bold green" if rec else "white"
+        self._linha(g, "Achadas", Text(_fmt_num(rec), style=estilo))
+
+        t0 = s.get("time_start")
+        tfim = s.get("estimated_stop")
+        if t0 and tfim:
+            agora = time.time()
+            self._linha(g, "Tempo",
+                        "decorridos %s · faltam %s" %
+                        (fmt_tempo(max(0, agora - t0)),
+                         fmt_tempo(max(0, tfim - agora))))
+        return Panel(g, title="[bold]AirStrike - quebra ao vivo[/bold]",
+                     border_style="cyan")
+
+
 def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
-                  mask=None, custom=None, increment=False):
+                  mask=None, custom=None, increment=False,
+                  rotulo=None, total=None):
     """Quebra um .22000 com o hashcat (-m 22000). Devolve a chave ou None.
 
     Com mask faz ataque de mascara (-a 3); sem mask usa a wordlist (-a 0),
@@ -886,9 +1034,15 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
     except OSError:
         pass
 
+    ataque = ("mascara %s" % mask) if mask else \
+        ("wordlist %s" % os.path.basename(wordlist or "?")) + \
+        (" + regras" if rules else "")
+    painel = PainelHashcat(rotulo=rotulo, ataque=ataque, total=total)
     cmd = ["hashcat", "-m", "22000", "-a", "3" if mask else "0",
-           "--status", "--status-timer=15",
+           "--status", "--status-timer=%d" % (2 if painel.ativo else 15),
            "--outfile", out_file, "--outfile-format", "2"]
+    if painel.ativo:
+        cmd += ["--status-json"]
     if extra_args:
         cmd += list(extra_args)
     if rules and not mask:
@@ -915,19 +1069,33 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
             encoding="utf-8",
             errors="replace",
         )
-        for line in proc.stdout:
-            for parte in line.replace("\r", "\n").split("\n"):
-                p = parte.strip()
-                if not p:
-                    continue
-                if any(t in p for t in ("Status", "Cracked", "Exhausted", "Recovered",
-                                        "Approaching", "Hashfile", "ERROR", "error",
-                                        "No password hashes", "Backend", "Kernel",
-                                        "CUDA", "OpenCL", "INFO", "Speed", "Progress")):
-                    print(parte)
-                if ("No OpenCL, HIP or CUDA" in p or "clGetPlatformIDs" in p
-                        or "No devices found" in p or "no devices left" in p.lower()):
-                    sem_backend = True
+        with painel:
+            for line in proc.stdout:
+                for parte in line.replace("\r", "\n").split("\n"):
+                    p = parte.strip()
+                    if not p:
+                        continue
+                    if painel.ativo:
+                        if p.startswith("{"):
+                            try:
+                                painel.linha_json(json.loads(p))
+                            except ValueError:
+                                pass
+                        elif any(t in p for t in ("ERROR", "error", "Hashfile",
+                                                  "Exhausted", "Cracked",
+                                                  "Recovered", "Approaching")):
+                            painel.aviso(p)
+                    else:
+                        if any(t in p for t in ("Status", "Cracked", "Exhausted",
+                                                "Recovered", "Approaching",
+                                                "Hashfile", "ERROR", "error",
+                                                "No password hashes", "Backend",
+                                                "Kernel", "CUDA", "OpenCL",
+                                                "INFO", "Speed", "Progress")):
+                            print(parte)
+                    if ("No OpenCL, HIP or CUDA" in p or "clGetPlatformIDs" in p
+                            or "No devices found" in p or "no devices left" in p.lower()):
+                        sem_backend = True
         rc = proc.wait()
     except KeyboardInterrupt:
         warn("quebra interrompida pelo usuario")
@@ -946,18 +1114,23 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
     if os.path.isfile(out_file):
         try:
             with open(out_file, "r", encoding="utf-8", errors="replace") as fh:
-                chave = fh.read().strip() or None
+                chave = next((l.strip() for l in fh if l.strip()), None)
         except OSError:
             pass
     if chave is None:
         # Senha ja encontrada antes fica no potfile; o --show a recupera
         show_file = out_file + ".show"
+        try:
+            if os.path.exists(show_file):
+                os.remove(show_file)  # o --show acumula se deixar la
+        except OSError:
+            pass
         run(["hashcat", "-m", "22000", "--show", "--outfile", show_file,
              "--outfile-format", "2", hash_file], timeout=60)
         if os.path.isfile(show_file):
             try:
                 with open(show_file, "r", encoding="utf-8", errors="replace") as fh:
-                    chave = fh.read().strip() or None
+                    chave = next((l.strip() for l in fh if l.strip()), None)
             except OSError:
                 pass
     return chave
@@ -1272,7 +1445,9 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
                 if tem_hashcat:
                     chave = crack_hashcat(hash_file, wordlist,
                                           shlex.split(args.hashcat_args or ""),
-                                          rules=args.rules)
+                                          rules=args.rules,
+                                          rotulo=bssid,
+                                          total=None if args.rules else f["senhas"])
                 else:
                     if args.rules:
                         warn("--rules ignorado: aircrack-ng nao entende regras do hashcat")
@@ -1281,7 +1456,8 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
                 chave = crack_hashcat(hash_file, None,
                                       shlex.split(args.hashcat_args or ""),
                                       mask=f["mask"], custom=f["custom"],
-                                      increment=f["increment"])
+                                      increment=f["increment"],
+                                      rotulo=bssid, total=f.get("keyspace"))
         except RuntimeError as exc:
             err(f"frente '{f['nome']}' falhou: {exc}")
             warn("instale um backend e rode de novo:  sudo apt install pocl-opencl-icd")
