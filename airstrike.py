@@ -1420,8 +1420,14 @@ def crack_captura_existente(arquivo, args):
     """
     arquivo = os.path.abspath(arquivo)
     if not os.path.exists(arquivo):
-        err(f"captura nao encontrada: {arquivo}")
-        return 1
+        # aceita o PREFIXO da sessao (sem -NN.cap), como o menu entrega:
+        # reencontra o primeiro .cap dos pedacos daquela sessao
+        pedacos = caps_do_prefixo(arquivo)
+        if pedacos:
+            arquivo = pedacos[0]
+        else:
+            err(f"captura nao encontrada: {arquivo}")
+            return 1
 
     alvo = None
     if arquivo.lower().endswith(".22000"):
