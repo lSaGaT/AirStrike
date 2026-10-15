@@ -21,6 +21,7 @@ Nenhuma dependência externa de Python (somente biblioteca padrão).
 """
 
 import argparse
+import calendar
 import json
 import os
 import re
@@ -1045,11 +1046,13 @@ class PainelHashcat:
 
 def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
                   mask=None, custom=None, increment=False,
-                  rotulo=None, total=None):
+                  rotulo=None, total=None, hibrida=None):
     """Quebra um .22000 com o hashcat (-m 22000). Devolve a chave ou None.
 
-    Com mask faz ataque de mascara (-a 3); sem mask usa a wordlist (-a 0),
-    opcionalmente com regras do hashcat (-r arquivo).
+    Com hibrida=6 faz dicionario + mascara (-a 6, ex. essid + digitos);
+    com hibrida=7 faz mascara + dicionario (-a 7, digitos + essid).
+    Com mask e sem hibrida faz ataque de mascara (-a 3); sem mask usa a
+    wordlist (-a 0), opcionalmente com regras do hashcat (-r arquivo).
     """
     if not os.path.exists(hash_file):
         err(f"arquivo de hashes nao encontrado: {hash_file}")
@@ -1062,11 +1065,16 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
     except OSError:
         pass
 
-    ataque = ("mascara %s" % mask) if mask else \
-        ("wordlist %s" % os.path.basename(wordlist or "?")) + \
-        (" + regras" if rules else "")
+    if hibrida:
+        ataque = "hibrida %s + %s" % (os.path.basename(wordlist or "?"), mask)
+    elif mask:
+        ataque = "mascara %s" % mask
+    else:
+        ataque = ("wordlist %s" % os.path.basename(wordlist or "?")) + \
+            (" + regras" if rules else "")
     painel = PainelHashcat(rotulo=rotulo, ataque=ataque, total=total)
-    cmd = ["hashcat", "-m", "22000", "-a", "3" if mask else "0",
+    cmd = ["hashcat", "-m", "22000",
+           "-a", str(hibrida) if hibrida else ("3" if mask else "0"),
            "--status", "--status-timer=%d" % (2 if painel.ativo else 15),
            "--outfile", out_file, "--outfile-format", "2"]
     if painel.ativo:
@@ -1075,7 +1083,11 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
         cmd += list(extra_args)
     if rules and not mask:
         cmd += ["-r", rules]
-    if mask:
+    if hibrida == 6:
+        cmd += [hash_file, wordlist, mask]
+    elif hibrida == 7:
+        cmd += [hash_file, mask, wordlist]
+    elif mask:
         if custom:
             for flag in sorted(custom):
                 cmd += [flag, custom[flag]]
@@ -1309,6 +1321,112 @@ def parse_masks(spec):
     return itens
 
 
+def essid_variantes(essid):
+    """Variacoes do ESSID para a frente BR-smart (o pessoal usa o nome da
+    rede na senha): normal, minuscula, maiuscula, capitalizada, sem
+    separadores (NET_2A47 -> NET2A47, net2a47) e pedacos do nome
+    (o sufixo do AP da operadora: 2a47)."""
+    e = (essid or "").strip()
+    if not e:
+        return []
+    formas = {e, e.lower(), e.upper(), e.capitalize()}
+    junto = re.sub(r"[^A-Za-z0-9]+", "", e)
+    if junto:
+        formas |= {junto, junto.lower(), junto.upper()}
+    for pedaco in re.split(r"[^A-Za-z0-9]+", e):
+        if 3 <= len(pedaco) <= 8:
+            formas |= {pedaco, pedaco.lower(), pedaco.upper()}
+    return sorted(s for s in formas if s)
+
+
+def gerar_datas_dict(ano_min=1950, ano_max=2035):
+    """Datas de aniversario brasileiras em ddmmyy e ddmmyyyy (so dias reais)."""
+    linhas = []
+    for ano in range(ano_min, ano_max + 1):
+        for mes in range(1, 13):
+            for dia in range(1, calendar.monthrange(ano, mes)[1] + 1):
+                linhas.append("%02d%02d%02d" % (dia, mes, ano % 100))
+                linhas.append("%02d%02d%04d" % (dia, mes, ano))
+    return linhas
+
+
+PADROES_ARQUIVOS = [
+    "/usr/share/wordlists/fasttrack.txt",
+    "/usr/share/wordlists/fern-wifi/common.txt",
+]
+
+
+def padroes_fabricante():
+    """Senhas-padrao de roteador das listas pequenas ja instaladas no Kali."""
+    linhas, vistos = [], set()
+    for caminho in PADROES_ARQUIVOS:
+        try:
+            with open(caminho, encoding="utf-8", errors="replace") as fh:
+                for linha in fh:
+                    s = linha.strip()
+                    if len(s) >= 8 and s not in vistos:  # WPA exige 8+
+                        vistos.add(s)
+                        linhas.append(s)
+        except OSError:
+            continue
+    return linhas
+
+
+def frentes_br_smart(essid):
+    """Frentes de padrao brasileiro, da mais barata a mais cara.
+
+    Nome da rede + digitos (Joao1234, NET_2A47 -> 2a470707), datas de
+    aniversario (01011990) e senhas-padrao de fabricante. Roda ANTES da
+    wordlist e das mascaras porque cada uma custa segundos ou minutos.
+    """
+    frentes = []
+    variantes = essid_variantes(essid)
+    if variantes:
+        for n_dig in (2, 4):
+            frentes.append({
+                "nome": "br essid %s + %d digitos" % (essid[:14], n_dig),
+                "tipo": "br", "modo": 6, "mask": "?d" * n_dig,
+                "palavras": variantes,
+                "keyspace": len(variantes) * (10 ** n_dig)})
+        frentes.append({
+            "nome": "br 4 digitos + essid %s" % essid[:14],
+            "tipo": "br", "modo": 7, "mask": "?d?d?d?d",
+            "palavras": variantes,
+            "keyspace": len(variantes) * 10000})
+    datas = gerar_datas_dict()
+    frentes.append({"nome": "br datas (ddmmyy+ddmmyyyy)", "tipo": "br",
+                    "modo": 0, "palavras": datas, "keyspace": len(datas)})
+    padroes = padroes_fabricante()
+    if padroes:
+        frentes.append({"nome": "br padroes de fabricante", "tipo": "br",
+                        "modo": 0, "palavras": padroes,
+                        "keyspace": len(padroes)})
+    if variantes:
+        frentes.append({
+            "nome": "br essid %s + 6 digitos" % essid[:14],
+            "tipo": "br", "modo": 6, "mask": "?d?d?d?d?d?d",
+            "palavras": variantes,
+            "keyspace": len(variantes) * 1000000})
+    return frentes
+
+
+def crack_br(frente, hash_file, rotulo=None):
+    """Roda uma frente br-smart: grava o dicionario temporario e chama o hashcat."""
+    fd, caminho = tempfile.mkstemp(prefix="airstrike_br_", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(frente["palavras"]) + "\n")
+        return crack_hashcat(hash_file, caminho, None,
+                             mask=frente.get("mask"),
+                             hibrida=frente["modo"] or None,
+                             rotulo=rotulo, total=frente.get("keyspace"))
+    finally:
+        try:
+            os.remove(caminho)
+        except OSError:
+            pass
+
+
 def count_lines(path):
     n = 0
     try:
@@ -1403,7 +1521,8 @@ def benchmark_speed():
 def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
     """Roda as frentes de quebra em fila, da mais barata a mais cara.
 
-    Frente 1: wordlist (opcionalmente com regras --rules)
+    Frente 1: br-smart (essid+digitos, datas, padroes de fabricante)
+    Frente 2: wordlist (opcionalmente com regras --rules)
     Frentes seguintes: mascaras hashcat (-a 3) de --masks
     + frente de incremento numerico com --increment.
     Ctrl+C pula para a proxima frente.
@@ -1420,6 +1539,11 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
         tem_hashcat = False
 
     frentes = []
+    if tem_hashcat:
+        essid_hash = (info_22000(hash_file) or (None, None))[1] or ""
+        frentes.extend(frentes_br_smart(essid_hash))
+        if not essid_hash:
+            warn("ESSID vazio na hash: so rodam datas e padroes na frente br-smart")
     nome_wl = os.path.basename(wordlist) if wordlist else "(sem wordlist)"
     frentes.append({"nome": "wordlist %s%s" % (nome_wl, " + regras" if args.rules else ""),
                     "senhas": count_lines(wordlist) if wordlist else 0,
@@ -1480,6 +1604,8 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
                     if args.rules:
                         warn("--rules ignorado: aircrack-ng nao entende regras do hashcat")
                     chave = crack(cap_file, wordlist, bssid)
+            elif f["tipo"] == "br":
+                chave = crack_br(f, hash_file, rotulo=bssid)
             else:
                 chave = crack_hashcat(hash_file, None,
                                       shlex.split(args.hashcat_args or ""),

@@ -203,9 +203,14 @@ Apos capturar o handshake ou o PMKID, o AirStrike abre as frentes de
 quebra em fila, da mais barata a mais cara. Ctrl+C durante uma frente
 pula para a proxima:
 
-1. **Wordlist**: testa o rockyou.txt (e regras do hashcat com `--rules`)
-2. **Mascaras**: varre combinacoes com `hashcat -a 3`, sem depender de lista
-3. **Incremento**: com `--increment`, testa de 1 ate 8 digitos
+1. **BR-smart**: padroes de senha brasileiros, cada uma custa segundos
+   ou minutos — nome da rede + digitos (`Joao1234`, o `2a47` do
+   `NET_2A47` + `0707`), datas de aniversario (`01011990`) e
+   senhas-padrao de fabricante (fasttrack, fern-wifi). O essid sai
+   direto do hash capturado, sem voce configurar nada.
+2. **Wordlist**: testa o rockyou.txt (e regras do hashcat com `--rules`)
+3. **Mascaras**: varre combinacoes com `hashcat -a 3`, sem depender de lista
+4. **Incremento**: com `--increment`, testa de 1 ate 8 digitos
 
 Presets de mascara prontos:
 
@@ -223,10 +228,16 @@ Antes de comecar, o AirStrike mostra a estimativa de tempo de cada frente:
 ```
   Frente                         Espaco      Tempo estimado
   ------------------------------------------------------------------
+  br essid CBN + 2 digitos                   300             <1s
+  br essid CBN + 4 digitos                30.000             <1s
+  br 4 digitos + essid CBN                30.000             <1s
+  br datas (ddmmyy+ddmmyyyy)              62.822             <1s
+  br padroes de fabricante                   320             <1s
+  br essid CBN + 6 digitos             3.000.000             20s
   wordlist rockyou.txt             14.344.392            1.6min
   mascara numeric8                100.000.000           11.1min
   ------------------------------------------------------------------
-  TOTAL                           114.344.392           12.7min
+  TOTAL                           117.471.834           13.1min
 ```
 
 Exemplos:
@@ -239,7 +250,7 @@ sudo airstrike --bssid AA:BB:CC:DD:EE:FF --masks numeric8 --increment
 sudo airstrike --masks "numeric8,numeric10,factory,?l?l?l?l?d?d?d?d"
 
 # Regras do hashcat na wordlist (multiplica os candidatos gerados)
-sudo airstrike --rules /usr/share/hashcat/rules/best64.rule
+sudo airstrike --rules /usr/share/hashcat/rules/best66.rule
 
 # Medir a GPU real antes de estimar os tempos
 sudo airstrike --bench

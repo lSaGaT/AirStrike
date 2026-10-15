@@ -191,6 +191,28 @@ check("argparse hspeed", a3.hspeed == 250000.0)
 check("argparse rules padrao None", a3.rules is None)
 check("argparse masks padrao numeric8", p.parse_args([]).masks == "numeric8")
 
+check("essid variantes CBN", m.essid_variantes("CBN") == ["CBN", "Cbn", "cbn"])
+v2 = m.essid_variantes("NET_2A47")
+check("essid variantes NET_2A47",
+      "net2a47" in v2 and "2a47" in v2 and "NET2A47" in v2)
+check("essid variantes vazio", m.essid_variantes("") == [])
+d = m.gerar_datas_dict()
+check("datas bissexto real", "29022020" in d and "29022021" not in d)
+check("datas dia inexistente", "31042000" not in d)
+check("datas dois formatos", "010190" in d and "01011990" in d)
+check("padroes com 8+ chars",
+      all(len(s) >= 8 for s in m.padroes_fabricante()))
+fs_br = m.frentes_br_smart("CBN")
+check("frentes br-smart CBN sao 6", len(fs_br) == 6)
+check("frente br essid+2d keyspace", fs_br[0]["keyspace"] == 300)
+check("frente br essid+4d keyspace", fs_br[1]["keyspace"] == 30000)
+check("frente br hibrida invertida", fs_br[2]["modo"] == 7)
+check("frente br datas keyspace", fs_br[3]["keyspace"] == len(d))
+check("frente br sem essid so 2",
+      len(m.frentes_br_smart("")) == 2)
+check("estimate imprime frentes br sem excecao",
+      m.print_estimate(fs_br, 4660) is None)
+
 print()
 print("FALHAS: %d" % len(fails))
 sys.exit(1 if fails else 0)
