@@ -887,6 +887,7 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
         pass
 
     cmd = ["hashcat", "-m", "22000", "-a", "3" if mask else "0",
+           "--status", "--status-timer=15",
            "--outfile", out_file, "--outfile-format", "2"]
     if extra_args:
         cmd += list(extra_args)
@@ -922,7 +923,7 @@ def crack_hashcat(hash_file, wordlist, extra_args=None, rules=None,
                 if any(t in p for t in ("Status", "Cracked", "Exhausted", "Recovered",
                                         "Approaching", "Hashfile", "ERROR", "error",
                                         "No password hashes", "Backend", "Kernel",
-                                        "CUDA", "OpenCL", "INFO")):
+                                        "CUDA", "OpenCL", "INFO", "Speed", "Progress")):
                     print(parte)
                 if ("No OpenCL, HIP or CUDA" in p or "clGetPlatformIDs" in p
                         or "No devices found" in p or "no devices left" in p.lower()):
@@ -1156,12 +1157,38 @@ def hashcat_sem_backend():
     return rc != 0 or "Backend Device ID" not in out
 
 
+def hashcat_somente_cpu():
+    """True quando o hashcat so tem dispositivos CPU (PoCL e companhia)."""
+    rc, out = run(["hashcat", "-I"], timeout=60)
+    tipos = re.findall(r"Type\.{2,}\s*:\s*(\S+)", out)
+    return bool(tipos) and all(t.lower() == "cpu" for t in tipos)
+
+
+BENCH_CACHE = os.path.expanduser("~/.airstrike_bench")
+
+
+def velocidade_em_cache():
+    try:
+        with open(BENCH_CACHE, encoding="utf-8") as fh:
+            return float(fh.read().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def salvar_velocidade_cache(valor):
+    try:
+        with open(BENCH_CACHE, "w", encoding="utf-8") as fh:
+            fh.write("%.0f\n" % valor)
+    except OSError:
+        pass
+
+
 def benchmark_speed():
     """Mede a velocidade real do hashcat no modo 22000 (hashcat -b)."""
     if not shutil.which("hashcat"):
         return None
-    info("medindo a velocidade real do hashcat (hashcat -b -m 22000, pode demorar)...")
-    rc, out = run(["hashcat", "-b", "-m", "22000"], timeout=300)
+    info("medindo a velocidade real do hashcat (hashcat -b -m 22000, ~40s)...")
+    rc, out = run(["hashcat", "-b", "-m", "22000", "--runtime=40"], timeout=300)
     m = re.search(r"Speed\.#\S*:\s*([\d.]+)\s*([kMG]?H)/s", out)
     if not m:
         if "No OpenCL" in out or "clGetPlatformIDs" in out:
@@ -1218,6 +1245,22 @@ def crack_pipeline(hash_file, cap_file, wordlist, bssid, cracker, args):
                "{:,}".format(int(hspeed)).replace(",", "."))
         else:
             warn("nao foi possivel medir a velocidade; usando o valor de --hspeed")
+    elif tem_hashcat and hashcat_somente_cpu():
+        # em CPU o padrao de 150k H/s mente por 30x: mede uma vez e guarda
+        medido = velocidade_em_cache()
+        if medido:
+            hspeed = medido
+            ok("velocidade real em cache (%s): %s hashes/s" %
+               (BENCH_CACHE, "{:,}".format(int(hspeed)).replace(",", ".")))
+        else:
+            medido = benchmark_speed()
+            if medido:
+                hspeed = medido
+                salvar_velocidade_cache(medido)
+                ok("velocidade medida e salva em cache: %s hashes/s" %
+                   "{:,}".format(int(hspeed)).replace(",", "."))
+            else:
+                warn("nao foi possivel medir; usando o valor de --hspeed")
 
     print_estimate(frentes, hspeed)
 
